@@ -1,0 +1,10 @@
+do_artifacts/
+.do_access
+examples/.demo-accounts/
+examples/.demo-artifacts/
+.DS_Store
+examples/node_modules/
+apache/.libs/
+*.apache.o
+core/*.o
+providers/stellar/*.o

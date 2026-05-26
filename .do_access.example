@@ -1,0 +1,6 @@
+# Copy this file to `.do_access` before asking Codex to create a new
+# DigitalOcean host from `DO_AGENT.md`.
+#
+# This file is local-only. Do not commit the real `.do_access`.
+
+DIGITAL_OCEAN_TOKEN=replace-me
