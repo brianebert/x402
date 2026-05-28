@@ -33,7 +33,7 @@ npm i
 
 # Create testnet accounts for buyer, 2 split receivers, and a server account to run splits
 # The split accounts are saved for later, when you set up your own server
-# Use the buyer account to test against 64.23.244.67
+# Use the buyer account to test against 143.198.231.193
 node scripts/make-split-demo-accounts.mjs
 ```
 ### Don't forget to arm your `x402` buyer account with USDC from the circle [faucet](https://faucet.circle.com/)!!!
@@ -41,19 +41,19 @@ node scripts/make-split-demo-accounts.mjs
 cat .demo-accounts/split-server/split-accounts.json
 # Use buyer.secretKey in place of 'S12345...DEF'
 STELLAR_PRIVATE_KEY='S12345...DEF'
-# To run tests against a testnet server at 64.23.244.67
+# To run tests against a testnet server at 143.198.231.193
 # Buy single access, view decoded PAYMENT-REQUIRED and PAYMENT-SIGNATURE
-./scripts/raw-stellar-two-step.sh 64.23.244.67
+./scripts/raw-stellar-two-step.sh 143.198.231.193
 ```
 You can also pre-pay for faster access to the content
 ```sh
 STELLAR_PRIVATE_KEY='S12345...DEF'
 # Where N = 2|10|100, buy N accesses to /app/foo and call it  M times
-# node buyers/buyer-stellar-prepaid.mjs http://64.23.244.67/priceX N M
+# node buyers/buyer-stellar-prepaid.mjs http://143.198.231.193/priceX N M
 # Buys 2 accesses and calls the protected endpoint 2 times
-node buyers/buyer-stellar-prepaid.mjs http://64.23.244.67/priceX 2 2
+node buyers/buyer-stellar-prepaid.mjs http://143.198.231.193/priceX 2 2
 ```
-The server at 64.23.244.67 is set up to split payments 70/30 between accounts [GAQH3...LHEBX](https://horizon-testnet.stellar.org/accounts/GAQH3VXDLXCUESK4CGC77BBA5X4CFSR2HAWTVXYAC2H6AHI6BE7LHEBX) and [GACTC...WJ5P2](https://horizon-testnet.stellar.org/accounts/GACTCLSHLLAPVXEATOTMR6ZVKRGEJYPO6RDMZXJS76BXRBCAH5YWJ5P2). Both scripts display response header `X402-Split-Transaction-Hash: <hash>`. You can use a tool like [Laboratory](https://lab.stellar.org/endpoints/horizon/operations/transaction?$=network$id=testnet&label=Testnet&horizonUrl=https:////horizon-testnet.stellar.org&rpcUrl=https:////soroban-testnet.stellar.org&passphrase=Test%20SDF%20Network%20/;%20September%202015;;) to view the split payments. The shell script will show you a 7¢/3¢ split and the node script will show the 70/30 split of N X 10¢.
+The server at 143.198.231.193 is set up to split payments 70/30 between accounts [GAQH3...LHEBX](https://horizon-testnet.stellar.org/accounts/GAQH3VXDLXCUESK4CGC77BBA5X4CFSR2HAWTVXYAC2H6AHI6BE7LHEBX) and [GACTC...WJ5P2](https://horizon-testnet.stellar.org/accounts/GACTCLSHLLAPVXEATOTMR6ZVKRGEJYPO6RDMZXJS76BXRBCAH5YWJ5P2). Both scripts display response header `X402-Split-Transaction-Hash: <hash>`. You can use a tool like [Laboratory](https://lab.stellar.org/endpoints/horizon/operations/transaction?$=network$id=testnet&label=Testnet&horizonUrl=https:////horizon-testnet.stellar.org&rpcUrl=https:////soroban-testnet.stellar.org&passphrase=Test%20SDF%20Network%20/;%20September%202015;;) to view the split payments. The shell script will show you a 7¢/3¢ split and the node script will show the 70/30 split of N X 10¢.
 
 
 ## Run your own server
@@ -77,7 +77,7 @@ The server at 64.23.244.67 is set up to split payments 70/30 between accounts [G
     - Or you can let your agent finish loading `x402+` on your new server.
   - The $12/month droplet is more than sufficient for x402 testing and is easily grown. 
   - The new server is not firewalled.
-    - The demo server running at 64.23.244.67 is open on ports 80 and 443, with ssh via its private ip address.
+    - The demo server running at 143.198.231.193 is open on ports 80 and 443, with ssh via its private ip address.
 
 #### now change the ip address when calling the test scripts to run off your own server.
 
