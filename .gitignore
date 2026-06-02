@@ -1,5 +1,9 @@
 do_artifacts/
 .do_access
+GoDaddy API Creds.txt
+my_resume_notes.rtf
+resume.txt
+docs/MULTI_CATALOG_X402_HANDOFF.md
 examples/.demo-accounts/
 examples/.demo-artifacts/
 .DS_Store

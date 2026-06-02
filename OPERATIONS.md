@@ -159,6 +159,72 @@ Facilitator bearer keys should be file-backed:
 
 - `/etc/apache2/x402-secrets/facilitator.key`
 
+## Dynamic Challenges
+
+`mod_x402` can expose a server-wide authenticated challenge endpoint for store
+apps that create orders dynamically:
+
+```apache
+X402ChallengeEndpoint /x402/challenge
+X402DynamicCheckoutEndpoint /api/store/checkout
+X402IntentSecretFile /etc/apache2/x402-secrets/intent.key
+```
+
+The store app calls the endpoint with `POST`, header
+`X-X402-Intent-Secret: <secret>`, and JSON:
+
+```json
+{
+  "store_id": "nobody",
+  "catalog_id": "default",
+  "order_id": "ord_123",
+  "payment_identifier": "ord_123",
+  "resource": "/api/store/checkout",
+  "network": "stellar:testnet",
+  "asset": "USDC:<issuer>",
+  "amount_usdc": "0.42",
+  "pay_to": "G...",
+  "description": "nobody order 123",
+  "mime_type": "application/json",
+  "timeout": 30
+}
+```
+
+Use either `amount_usdc` for decimal USDC values or `amount` for raw asset base
+units. The response is `200 OK` with a `PAYMENT-REQUIRED` response header and
+body:
+
+```json
+{"paymentRequired":"<base64 challenge>","paymentIdentifier":"ord_123"}
+```
+
+If a systemwide split policy is enabled, the same global operator split policy
+is applied to dynamic challenges. Client-supplied trusted payment headers are
+stripped before the endpoint handles the request.
+
+Dynamic checkout is XOR with static paid retries. Do not configure the dynamic
+checkout path with `X402 On`. The buyer submits `PAYMENT-SIGNATURE` to
+`X402DynamicCheckoutEndpoint`; Apache decodes `paymentIdentifier`, loads the
+stored intent, verifies and settles it once, injects trusted `X-X402-*` headers,
+and then lets the proxied store app handle the request.
+
+## Trusted Upstream Headers
+
+`mod_x402` strips incoming client-supplied `X-X402-*` payment headers before
+the request reaches an upstream app. After a payment or prepaid access check
+succeeds, the module injects trusted request headers for proxied/store apps:
+
+- `X-X402-Paid: true`
+- `X-X402-Payer: <payer account>`
+- `X-X402-Transaction: <settlement transaction or prepaid marker>`
+- `X-X402-Amount: <integer amount in asset base units>`
+- `X-X402-Payment-Identifier: <payment identifier when present>`
+- `X-X402-Settlement-Mode: <facilitator|local|hybrid|prepaid>`
+
+Store apps may use these headers only when the request comes through the
+trusted Apache/x402 proxy. They should not accept these headers from direct
+client traffic.
+
 ## Buyer Tests
 
 Direct paid request:

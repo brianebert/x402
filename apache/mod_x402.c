@@ -9,8 +9,10 @@
 #include <stdlib.h>
 #include <time.h>
 #include <ctype.h>
+#include <errno.h>
 
 #include <apr_base64.h>
+#include <apr_file_io.h>
 #include <apr_lib.h>
 #include <apr_strings.h>
 #include <apr_tables.h>
@@ -33,6 +35,16 @@
 extern module AP_MODULE_DECLARE_DATA x402_module;
 
 #define X402_DEFAULT_CREDIT_DB_PATH "/var/lib/x402/credits.db"
+#define X402_DEFAULT_CHALLENGE_ENDPOINT "/x402/challenge"
+#define X402_INTENT_SECRET_HEADER "X-X402-Intent-Secret"
+#define X402_MAX_INTENT_BODY 16384
+
+#define X402_TRUSTED_PAID_HEADER "X-X402-Paid"
+#define X402_TRUSTED_PAYER_HEADER "X-X402-Payer"
+#define X402_TRUSTED_TRANSACTION_HEADER "X-X402-Transaction"
+#define X402_TRUSTED_AMOUNT_HEADER "X-X402-Amount"
+#define X402_TRUSTED_PAYMENT_IDENTIFIER_HEADER "X-X402-Payment-Identifier"
+#define X402_TRUSTED_SETTLEMENT_MODE_HEADER "X-X402-Settlement-Mode"
 
 typedef struct x402_dir_config {
   int enabled;
@@ -50,12 +62,74 @@ typedef struct x402_server_config {
   int stakeholder_overflow;
   size_t stakeholder_count;
   x402_stakeholder stakeholders[X402_MAX_STAKEHOLDERS];
+  char challenge_endpoint[X402_MAX_ROUTE];
+  char dynamic_checkout_endpoint[X402_MAX_ROUTE];
+  char intent_secret_file[X402_MAX_PATH];
 } x402_server_config;
 static apr_thread_mutex_t *x402_credit_mutex = NULL;
 static sqlite3 *x402_credit_db = NULL;
 static char x402_credit_db_path[X402_MAX_PATH] = X402_DEFAULT_CREDIT_DB_PATH;
 static sqlite3_int64 x402_credit_db_last_cleanup = 0;
 static int x402_same_route(const char *left, const char *right);
+static void x402_init_dynamic_policy(x402_route_policy *policy);
+
+static uint64_t x402_effective_payment_amount(const x402_route_policy *policy,
+                                              const x402_request_context *request)
+{
+  uint32_t multiplier = 1;
+
+  if(policy == NULL) {
+    return 0;
+  }
+  if(request != NULL && request->requested_multiplier != 0) {
+    multiplier = request->requested_multiplier;
+  }
+  return policy->amount * (uint64_t)multiplier;
+}
+
+static void x402_strip_trusted_request_headers(request_rec *r)
+{
+  if(r == NULL || r->headers_in == NULL) {
+    return;
+  }
+
+  apr_table_unset(r->headers_in, X402_TRUSTED_PAID_HEADER);
+  apr_table_unset(r->headers_in, X402_TRUSTED_PAYER_HEADER);
+  apr_table_unset(r->headers_in, X402_TRUSTED_TRANSACTION_HEADER);
+  apr_table_unset(r->headers_in, X402_TRUSTED_AMOUNT_HEADER);
+  apr_table_unset(r->headers_in, X402_TRUSTED_PAYMENT_IDENTIFIER_HEADER);
+  apr_table_unset(r->headers_in, X402_TRUSTED_SETTLEMENT_MODE_HEADER);
+}
+
+static void x402_set_trusted_payment_headers(request_rec *r,
+                                             const char *payer,
+                                             const char *transaction,
+                                             uint64_t amount,
+                                             const char *payment_identifier,
+                                             const char *settlement_mode)
+{
+  if(r == NULL || r->headers_in == NULL) {
+    return;
+  }
+
+  x402_strip_trusted_request_headers(r);
+  apr_table_setn(r->headers_in, X402_TRUSTED_PAID_HEADER, "true");
+  apr_table_setn(r->headers_in,
+                 X402_TRUSTED_PAYER_HEADER,
+                 apr_pstrdup(r->pool, payer == NULL ? "" : payer));
+  apr_table_setn(r->headers_in,
+                 X402_TRUSTED_TRANSACTION_HEADER,
+                 apr_pstrdup(r->pool, transaction == NULL ? "" : transaction));
+  apr_table_setn(r->headers_in,
+                 X402_TRUSTED_AMOUNT_HEADER,
+                 apr_psprintf(r->pool, "%" PRIu64, amount));
+  apr_table_setn(r->headers_in,
+                 X402_TRUSTED_PAYMENT_IDENTIFIER_HEADER,
+                 apr_pstrdup(r->pool, payment_identifier == NULL ? "" : payment_identifier));
+  apr_table_setn(r->headers_in,
+                 X402_TRUSTED_SETTLEMENT_MODE_HEADER,
+                 apr_pstrdup(r->pool, settlement_mode == NULL ? "" : settlement_mode));
+}
 
 static int x402_server_has_global_split(const x402_server_config *cfg)
 {
@@ -308,6 +382,10 @@ static void *x402_create_server_config(apr_pool_t *pool, server_rec *server)
 
   (void)server;
   cfg->split_mode = X402_SPLIT_SINGLE;
+  snprintf(cfg->challenge_endpoint,
+           sizeof(cfg->challenge_endpoint),
+           "%s",
+           X402_DEFAULT_CHALLENGE_ENDPOINT);
   return cfg;
 }
 
@@ -329,6 +407,24 @@ static void *x402_merge_server_config(apr_pool_t *pool, void *basev, void *addv)
              sizeof(merged->splitter_contract),
              "%s",
              add->splitter_contract);
+  }
+  if(add->challenge_endpoint[0] != '\0') {
+    snprintf(merged->challenge_endpoint,
+             sizeof(merged->challenge_endpoint),
+             "%s",
+             add->challenge_endpoint);
+  }
+  if(add->dynamic_checkout_endpoint[0] != '\0') {
+    snprintf(merged->dynamic_checkout_endpoint,
+             sizeof(merged->dynamic_checkout_endpoint),
+             "%s",
+             add->dynamic_checkout_endpoint);
+  }
+  if(add->intent_secret_file[0] != '\0') {
+    snprintf(merged->intent_secret_file,
+             sizeof(merged->intent_secret_file),
+             "%s",
+             add->intent_secret_file);
   }
   merged->stakeholder_overflow = base->stakeholder_overflow || add->stakeholder_overflow;
   for(i = 0; i < add->stakeholder_count; ++i) {
@@ -789,6 +885,48 @@ static const char *x402_cmd_credit_db_path(cmd_parms *cmd, void *cfgv, const cha
   return x402_set_string(x402_credit_db_path, sizeof(x402_credit_db_path), arg);
 }
 
+static const char *x402_cmd_challenge_endpoint(cmd_parms *cmd, void *cfgv, const char *arg)
+{
+  x402_server_config *server_cfg = (x402_server_config *)ap_get_module_config(
+      cmd->server->module_config,
+      &x402_module);
+
+  (void)cfgv;
+  if(arg == NULL || arg[0] != '/') {
+    return "X402ChallengeEndpoint must be an absolute URI path";
+  }
+  return x402_set_string(server_cfg->challenge_endpoint,
+                         sizeof(server_cfg->challenge_endpoint),
+                         arg);
+}
+
+static const char *x402_cmd_dynamic_checkout_endpoint(cmd_parms *cmd, void *cfgv, const char *arg)
+{
+  x402_server_config *server_cfg = (x402_server_config *)ap_get_module_config(
+      cmd->server->module_config,
+      &x402_module);
+
+  (void)cfgv;
+  if(arg == NULL || arg[0] != '/') {
+    return "X402DynamicCheckoutEndpoint must be an absolute URI path";
+  }
+  return x402_set_string(server_cfg->dynamic_checkout_endpoint,
+                         sizeof(server_cfg->dynamic_checkout_endpoint),
+                         arg);
+}
+
+static const char *x402_cmd_intent_secret_file(cmd_parms *cmd, void *cfgv, const char *arg)
+{
+  x402_server_config *server_cfg = (x402_server_config *)ap_get_module_config(
+      cmd->server->module_config,
+      &x402_module);
+
+  (void)cfgv;
+  return x402_set_string(server_cfg->intent_secret_file,
+                         sizeof(server_cfg->intent_secret_file),
+                         arg);
+}
+
 static const char *x402_cmd_credits_issued(cmd_parms *cmd, void *cfgv, const char *arg)
 {
   char *endptr = NULL;
@@ -987,6 +1125,17 @@ static int x402_credit_db_prepare(sqlite3 *db,
   return 1;
 }
 
+static const char *x402_sqlite_column_text(sqlite3_stmt *stmt, int index)
+{
+  const unsigned char *text;
+
+  if(stmt == NULL) {
+    return "";
+  }
+  text = sqlite3_column_text(stmt, index);
+  return text == NULL ? "" : (const char *)text;
+}
+
 static void x402_credit_db_close(void)
 {
   if(x402_credit_db != NULL) {
@@ -1039,6 +1188,39 @@ static int x402_credit_db_open(server_rec *server, int apply_schema)
       " submitted_at_ms INTEGER,"
       " confirmed_at_ms INTEGER,"
       " updated_at_ms INTEGER NOT NULL"
+      ");"
+      "CREATE TABLE IF NOT EXISTS dynamic_payment_intent ("
+      " payment_identifier TEXT PRIMARY KEY,"
+      " store_id TEXT,"
+      " catalog_id TEXT,"
+      " order_id TEXT,"
+      " resource TEXT NOT NULL,"
+      " network TEXT NOT NULL,"
+      " asset TEXT NOT NULL,"
+      " amount INTEGER NOT NULL,"
+      " pay_to TEXT,"
+      " description TEXT,"
+      " mime_type TEXT,"
+      " timeout_seconds INTEGER NOT NULL,"
+      " scheme TEXT NOT NULL,"
+      " mechanism TEXT NOT NULL,"
+      " split_mode INTEGER NOT NULL,"
+      " splitter_contract TEXT,"
+      " settlement_mode INTEGER NOT NULL,"
+      " status TEXT NOT NULL,"
+      " payer TEXT,"
+      " settlement_tx TEXT,"
+      " created_at INTEGER NOT NULL,"
+      " updated_at INTEGER NOT NULL,"
+      " settled_at INTEGER"
+      ");"
+      "CREATE TABLE IF NOT EXISTS dynamic_payment_stakeholder ("
+      " payment_identifier TEXT NOT NULL,"
+      " position INTEGER NOT NULL,"
+      " name TEXT NOT NULL,"
+      " basis_points INTEGER NOT NULL,"
+      " destination TEXT NOT NULL,"
+      " PRIMARY KEY (payment_identifier, position)"
       ");"
       "CREATE TABLE IF NOT EXISTS abuse_counter ("
       " scope TEXT NOT NULL,"
@@ -1448,6 +1630,252 @@ static void x402_credit_store(request_rec *r,
     sqlite3_finalize(stmt);
   }
   apr_thread_mutex_unlock(x402_credit_mutex);
+}
+
+static int x402_dynamic_intent_store(request_rec *r,
+                                     const x402_route_policy *policy,
+                                     const char *payment_identifier,
+                                     const char *store_id,
+                                     const char *catalog_id,
+                                     const char *order_id)
+{
+  sqlite3_stmt *stmt = NULL;
+  sqlite3_int64 now = (sqlite3_int64)time(NULL);
+  size_t i;
+  int ok = 0;
+
+  if(r == NULL || policy == NULL || payment_identifier == NULL || payment_identifier[0] == '\0' ||
+     x402_credit_db == NULL || x402_credit_mutex == NULL) {
+    return 0;
+  }
+
+  apr_thread_mutex_lock(x402_credit_mutex);
+  if(sqlite3_exec(x402_credit_db, "BEGIN IMMEDIATE TRANSACTION;", NULL, NULL, NULL) != SQLITE_OK) {
+    apr_thread_mutex_unlock(x402_credit_mutex);
+    return 0;
+  }
+
+  if(x402_credit_db_prepare(
+         x402_credit_db,
+         "INSERT INTO dynamic_payment_intent "
+         "(payment_identifier, store_id, catalog_id, order_id, resource, network, asset, amount, "
+         "pay_to, description, mime_type, timeout_seconds, scheme, mechanism, split_mode, "
+         "splitter_contract, settlement_mode, status, created_at, updated_at) "
+         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?) "
+         "ON CONFLICT(payment_identifier) DO UPDATE SET "
+         "store_id = CASE WHEN dynamic_payment_intent.status = 'pending' THEN excluded.store_id ELSE dynamic_payment_intent.store_id END, "
+         "catalog_id = CASE WHEN dynamic_payment_intent.status = 'pending' THEN excluded.catalog_id ELSE dynamic_payment_intent.catalog_id END, "
+         "order_id = CASE WHEN dynamic_payment_intent.status = 'pending' THEN excluded.order_id ELSE dynamic_payment_intent.order_id END, "
+         "resource = CASE WHEN dynamic_payment_intent.status = 'pending' THEN excluded.resource ELSE dynamic_payment_intent.resource END, "
+         "network = CASE WHEN dynamic_payment_intent.status = 'pending' THEN excluded.network ELSE dynamic_payment_intent.network END, "
+         "asset = CASE WHEN dynamic_payment_intent.status = 'pending' THEN excluded.asset ELSE dynamic_payment_intent.asset END, "
+         "amount = CASE WHEN dynamic_payment_intent.status = 'pending' THEN excluded.amount ELSE dynamic_payment_intent.amount END, "
+         "pay_to = CASE WHEN dynamic_payment_intent.status = 'pending' THEN excluded.pay_to ELSE dynamic_payment_intent.pay_to END, "
+         "description = CASE WHEN dynamic_payment_intent.status = 'pending' THEN excluded.description ELSE dynamic_payment_intent.description END, "
+         "mime_type = CASE WHEN dynamic_payment_intent.status = 'pending' THEN excluded.mime_type ELSE dynamic_payment_intent.mime_type END, "
+         "timeout_seconds = CASE WHEN dynamic_payment_intent.status = 'pending' THEN excluded.timeout_seconds ELSE dynamic_payment_intent.timeout_seconds END, "
+         "scheme = CASE WHEN dynamic_payment_intent.status = 'pending' THEN excluded.scheme ELSE dynamic_payment_intent.scheme END, "
+         "mechanism = CASE WHEN dynamic_payment_intent.status = 'pending' THEN excluded.mechanism ELSE dynamic_payment_intent.mechanism END, "
+         "split_mode = CASE WHEN dynamic_payment_intent.status = 'pending' THEN excluded.split_mode ELSE dynamic_payment_intent.split_mode END, "
+         "splitter_contract = CASE WHEN dynamic_payment_intent.status = 'pending' THEN excluded.splitter_contract ELSE dynamic_payment_intent.splitter_contract END, "
+         "settlement_mode = CASE WHEN dynamic_payment_intent.status = 'pending' THEN excluded.settlement_mode ELSE dynamic_payment_intent.settlement_mode END, "
+         "updated_at = CASE WHEN dynamic_payment_intent.status = 'pending' THEN excluded.updated_at ELSE dynamic_payment_intent.updated_at END;",
+         &stmt,
+         r->server)) {
+    sqlite3_bind_text(stmt, 1, payment_identifier, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, store_id == NULL ? "" : store_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, catalog_id == NULL ? "" : catalog_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 4, order_id == NULL ? "" : order_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 5, policy->route, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 6, policy->network, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 7, policy->asset, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 8, (sqlite3_int64)policy->amount);
+    sqlite3_bind_text(stmt, 9, policy->pay_to, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 10, policy->description, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 11, policy->mime_type, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 12, (int)policy->timeout_seconds);
+    sqlite3_bind_text(stmt, 13, policy->scheme, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 14, policy->mechanism, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 15, (int)policy->split_mode);
+    sqlite3_bind_text(stmt, 16, policy->splitter_contract, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 17, (int)policy->settlement_mode);
+    sqlite3_bind_int64(stmt, 18, now);
+    sqlite3_bind_int64(stmt, 19, now);
+    ok = sqlite3_step(stmt) == SQLITE_DONE;
+    sqlite3_finalize(stmt);
+  }
+
+  if(ok) {
+    ok = 0;
+    if(x402_credit_db_prepare(x402_credit_db,
+                              "SELECT status FROM dynamic_payment_intent WHERE payment_identifier = ?;",
+                              &stmt,
+                              r->server)) {
+      sqlite3_bind_text(stmt, 1, payment_identifier, -1, SQLITE_TRANSIENT);
+      if(sqlite3_step(stmt) == SQLITE_ROW &&
+         strcmp(x402_sqlite_column_text(stmt, 0), "pending") == 0) {
+        ok = 1;
+      }
+      sqlite3_finalize(stmt);
+      stmt = NULL;
+    }
+  }
+
+  if(ok) {
+    if(x402_credit_db_prepare(x402_credit_db,
+                              "DELETE FROM dynamic_payment_stakeholder WHERE payment_identifier = ?;",
+                              &stmt,
+                              r->server)) {
+      sqlite3_bind_text(stmt, 1, payment_identifier, -1, SQLITE_TRANSIENT);
+      ok = sqlite3_step(stmt) == SQLITE_DONE;
+      sqlite3_finalize(stmt);
+      stmt = NULL;
+    }
+    else {
+      ok = 0;
+    }
+    for(i = 0; i < policy->stakeholder_count; ++i) {
+      if(!x402_credit_db_prepare(x402_credit_db,
+                                 "INSERT INTO dynamic_payment_stakeholder "
+                                 "(payment_identifier, position, name, basis_points, destination) "
+                                 "VALUES (?, ?, ?, ?, ?);",
+                                 &stmt,
+                                 r->server)) {
+        ok = 0;
+        break;
+      }
+      sqlite3_bind_text(stmt, 1, payment_identifier, -1, SQLITE_TRANSIENT);
+      sqlite3_bind_int(stmt, 2, (int)i);
+      sqlite3_bind_text(stmt, 3, policy->stakeholders[i].name, -1, SQLITE_TRANSIENT);
+      sqlite3_bind_int(stmt, 4, (int)policy->stakeholders[i].basis_points);
+      sqlite3_bind_text(stmt, 5, policy->stakeholders[i].destination, -1, SQLITE_TRANSIENT);
+      if(sqlite3_step(stmt) != SQLITE_DONE) {
+        ok = 0;
+      }
+      sqlite3_finalize(stmt);
+      stmt = NULL;
+      if(!ok) {
+        break;
+      }
+    }
+  }
+
+  sqlite3_exec(x402_credit_db, ok ? "COMMIT;" : "ROLLBACK;", NULL, NULL, NULL);
+  apr_thread_mutex_unlock(x402_credit_mutex);
+  return ok;
+}
+
+static int x402_dynamic_intent_load(request_rec *r,
+                                    const char *payment_identifier,
+                                    x402_route_policy *policy,
+                                    char *status_out,
+                                    size_t status_out_size)
+{
+  sqlite3_stmt *stmt = NULL;
+  int found = 0;
+
+  if(r == NULL || payment_identifier == NULL || payment_identifier[0] == '\0' || policy == NULL ||
+     x402_credit_db == NULL || x402_credit_mutex == NULL) {
+    return 0;
+  }
+
+  x402_init_dynamic_policy(policy);
+  apr_thread_mutex_lock(x402_credit_mutex);
+  if(x402_credit_db_prepare(
+         x402_credit_db,
+         "SELECT resource, network, asset, amount, pay_to, description, mime_type, timeout_seconds, "
+         "scheme, mechanism, split_mode, splitter_contract, settlement_mode, status "
+         "FROM dynamic_payment_intent WHERE payment_identifier = ?;",
+         &stmt,
+         r->server)) {
+    sqlite3_bind_text(stmt, 1, payment_identifier, -1, SQLITE_TRANSIENT);
+    if(sqlite3_step(stmt) == SQLITE_ROW) {
+      snprintf(policy->route, sizeof(policy->route), "%s", x402_sqlite_column_text(stmt, 0));
+      snprintf(policy->network, sizeof(policy->network), "%s", x402_sqlite_column_text(stmt, 1));
+      snprintf(policy->asset, sizeof(policy->asset), "%s", x402_sqlite_column_text(stmt, 2));
+      policy->amount = (uint64_t)sqlite3_column_int64(stmt, 3);
+      snprintf(policy->pay_to, sizeof(policy->pay_to), "%s", x402_sqlite_column_text(stmt, 4));
+      snprintf(policy->description, sizeof(policy->description), "%s", x402_sqlite_column_text(stmt, 5));
+      snprintf(policy->mime_type, sizeof(policy->mime_type), "%s", x402_sqlite_column_text(stmt, 6));
+      policy->timeout_seconds = (uint32_t)sqlite3_column_int(stmt, 7);
+      snprintf(policy->scheme, sizeof(policy->scheme), "%s", x402_sqlite_column_text(stmt, 8));
+      snprintf(policy->mechanism, sizeof(policy->mechanism), "%s", x402_sqlite_column_text(stmt, 9));
+      policy->split_mode = (x402_split_mode)sqlite3_column_int(stmt, 10);
+      snprintf(policy->splitter_contract,
+               sizeof(policy->splitter_contract),
+               "%s",
+               x402_sqlite_column_text(stmt, 11));
+      policy->settlement_mode = (x402_settlement_mode)sqlite3_column_int(stmt, 12);
+      if(status_out != NULL && status_out_size > 0) {
+        snprintf(status_out, status_out_size, "%s", x402_sqlite_column_text(stmt, 13));
+      }
+      found = 1;
+    }
+    sqlite3_finalize(stmt);
+  }
+  if(found && x402_credit_db_prepare(x402_credit_db,
+                                     "SELECT name, basis_points, destination "
+                                     "FROM dynamic_payment_stakeholder "
+                                     "WHERE payment_identifier = ? ORDER BY position;",
+                                     &stmt,
+                                     r->server)) {
+    sqlite3_bind_text(stmt, 1, payment_identifier, -1, SQLITE_TRANSIENT);
+    while(sqlite3_step(stmt) == SQLITE_ROW &&
+          policy->stakeholder_count < X402_MAX_STAKEHOLDERS) {
+      x402_stakeholder *stakeholder = &policy->stakeholders[policy->stakeholder_count++];
+      snprintf(stakeholder->name, sizeof(stakeholder->name), "%s", x402_sqlite_column_text(stmt, 0));
+      stakeholder->basis_points = (uint16_t)sqlite3_column_int(stmt, 1);
+      snprintf(stakeholder->destination,
+               sizeof(stakeholder->destination),
+               "%s",
+               x402_sqlite_column_text(stmt, 2));
+    }
+    sqlite3_finalize(stmt);
+  }
+  apr_thread_mutex_unlock(x402_credit_mutex);
+  return found;
+}
+
+static int x402_dynamic_intent_set_status(request_rec *r,
+                                          const char *payment_identifier,
+                                          const char *from_status,
+                                          const char *to_status,
+                                          const char *payer,
+                                          const char *settlement_tx)
+{
+  sqlite3_stmt *stmt = NULL;
+  sqlite3_int64 now = (sqlite3_int64)time(NULL);
+  int changed = 0;
+
+  if(r == NULL || payment_identifier == NULL || payment_identifier[0] == '\0' ||
+     from_status == NULL || to_status == NULL || x402_credit_db == NULL || x402_credit_mutex == NULL) {
+    return 0;
+  }
+
+  apr_thread_mutex_lock(x402_credit_mutex);
+  if(x402_credit_db_prepare(
+         x402_credit_db,
+         "UPDATE dynamic_payment_intent SET status = ?, payer = COALESCE(NULLIF(?, ''), payer), "
+         "settlement_tx = COALESCE(NULLIF(?, ''), settlement_tx), updated_at = ?, "
+         "settled_at = CASE WHEN ? = 'settled' THEN ? ELSE settled_at END "
+         "WHERE payment_identifier = ? AND status = ?;",
+         &stmt,
+         r->server)) {
+    sqlite3_bind_text(stmt, 1, to_status, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, payer == NULL ? "" : payer, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, settlement_tx == NULL ? "" : settlement_tx, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 4, now);
+    sqlite3_bind_text(stmt, 5, to_status, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 6, now);
+    sqlite3_bind_text(stmt, 7, payment_identifier, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 8, from_status, -1, SQLITE_TRANSIENT);
+    if(sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(x402_credit_db) == 1) {
+      changed = 1;
+    }
+    sqlite3_finalize(stmt);
+  }
+  apr_thread_mutex_unlock(x402_credit_mutex);
+  return changed;
 }
 
 static const char *x402_request_host(request_rec *r)
@@ -1949,6 +2377,12 @@ static int x402_try_prepaid_access(request_rec *r, x402_dir_config *cfg, int *se
 
   apr_table_setn(r->notes, "x402-settled", "1");
   apr_table_setn(r->notes, "x402-payer", apr_pstrdup(r->pool, payer));
+  x402_set_trusted_payment_headers(r,
+                                   payer,
+                                   synthetic.transaction_ref,
+                                   cfg->policy.amount,
+                                   "",
+                                   synthetic.settlement_mode);
   apr_table_setn(r->headers_out,
                  "PAYMENT-RESPONSE",
                  x402_encode_header_value(r->pool, response_json));
@@ -1965,8 +2399,8 @@ static int x402_try_prepaid_access(request_rec *r, x402_dir_config *cfg, int *se
 }
 
 static int x402_emit_required(request_rec *r,
-                              x402_dir_config *cfg,
-                              const x402_provider *provider)
+                             x402_dir_config *cfg,
+                             const x402_provider *provider)
 {
   char error[X402_MAX_TEXT];
   char json[X402_MAX_JSON];
@@ -2028,6 +2462,504 @@ static int x402_emit_required(request_rec *r,
                    x402_encode_header_value(r->pool, challenge_json));
   }
   return HTTP_PAYMENT_REQUIRED;
+}
+
+static int x402_read_request_body(request_rec *r, char **body_out)
+{
+  char buffer[4096];
+  apr_size_t used = 0;
+  long read_len;
+
+  if(body_out == NULL) {
+    return HTTP_INTERNAL_SERVER_ERROR;
+  }
+  *body_out = NULL;
+
+  if(ap_setup_client_block(r, REQUEST_CHUNKED_ERROR) != OK) {
+    return HTTP_BAD_REQUEST;
+  }
+  if(!ap_should_client_block(r)) {
+    *body_out = apr_pstrdup(r->pool, "");
+    return OK;
+  }
+
+  *body_out = (char *)apr_pcalloc(r->pool, X402_MAX_INTENT_BODY + 1);
+  while((read_len = ap_get_client_block(r, buffer, sizeof(buffer))) > 0) {
+    if(used + (apr_size_t)read_len > X402_MAX_INTENT_BODY) {
+      return HTTP_REQUEST_ENTITY_TOO_LARGE;
+    }
+    memcpy(*body_out + used, buffer, (apr_size_t)read_len);
+    used += (apr_size_t)read_len;
+  }
+  if(read_len < 0) {
+    return HTTP_BAD_REQUEST;
+  }
+  (*body_out)[used] = '\0';
+  return OK;
+}
+
+static const char *x402_read_trimmed_file(apr_pool_t *pool, const char *path, char **value_out)
+{
+  apr_file_t *file = NULL;
+  apr_finfo_t finfo;
+  apr_size_t wanted;
+  apr_size_t got;
+  char *value;
+
+  if(pool == NULL || path == NULL || path[0] == '\0' || value_out == NULL) {
+    return "missing file path";
+  }
+  *value_out = NULL;
+  if(apr_stat(&finfo, path, APR_FINFO_SIZE, pool) != APR_SUCCESS || finfo.size <= 0 ||
+     finfo.size > X402_MAX_TEXT) {
+    return "failed to stat file";
+  }
+  if(apr_file_open(&file, path, APR_READ, APR_OS_DEFAULT, pool) != APR_SUCCESS) {
+    return "failed to open file";
+  }
+  value = (char *)apr_pcalloc(pool, (apr_size_t)finfo.size + 1);
+  wanted = (apr_size_t)finfo.size;
+  got = wanted;
+  if(apr_file_read(file, value, &got) != APR_SUCCESS || got != wanted) {
+    apr_file_close(file);
+    return "failed to read file";
+  }
+  apr_file_close(file);
+  while(got > 0 && apr_isspace(value[got - 1])) {
+    value[--got] = '\0';
+  }
+  while(value[0] != '\0' && apr_isspace(value[0])) {
+    ++value;
+    --got;
+  }
+  if(got == 0) {
+    return "empty file";
+  }
+  *value_out = value;
+  return NULL;
+}
+
+static int x402_authorize_intent_request(request_rec *r, const x402_server_config *server_cfg)
+{
+  const char *provided;
+  char *expected = NULL;
+  const char *error;
+  size_t provided_len;
+  size_t expected_len;
+
+  if(server_cfg == NULL || server_cfg->intent_secret_file[0] == '\0') {
+    return HTTP_NOT_FOUND;
+  }
+  error = x402_read_trimmed_file(r->pool, server_cfg->intent_secret_file, &expected);
+  if(error != NULL) {
+    ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "x402 intent secret error: %s", error);
+    return HTTP_INTERNAL_SERVER_ERROR;
+  }
+  provided = apr_table_get(r->headers_in, X402_INTENT_SECRET_HEADER);
+  if(provided == NULL) {
+    return HTTP_FORBIDDEN;
+  }
+  provided_len = strlen(provided);
+  expected_len = strlen(expected);
+  if(provided_len != expected_len ||
+     sodium_memcmp(provided, expected, expected_len) != 0) {
+    return HTTP_FORBIDDEN;
+  }
+  return OK;
+}
+
+static int x402_parse_uint64_string(const char *text, uint64_t *value_out)
+{
+  char *endptr = NULL;
+  unsigned long long value;
+
+  if(text == NULL || text[0] == '\0' || value_out == NULL) {
+    return 0;
+  }
+  errno = 0;
+  value = strtoull(text, &endptr, 10);
+  if(errno != 0 || endptr == text || *endptr != '\0' || value == 0) {
+    return 0;
+  }
+  *value_out = (uint64_t)value;
+  return 1;
+}
+
+static int x402_parse_usdc_decimal(const char *text, uint64_t *value_out)
+{
+  uint64_t whole = 0;
+  uint64_t fractional = 0;
+  uint64_t scale = 10000000;
+  size_t i = 0;
+  size_t frac_digits = 0;
+
+  if(text == NULL || text[0] == '\0' || value_out == NULL) {
+    return 0;
+  }
+  while(text[i] >= '0' && text[i] <= '9') {
+    whole = whole * 10 + (uint64_t)(text[i] - '0');
+    ++i;
+  }
+  if(text[i] == '.') {
+    ++i;
+    while(text[i] >= '0' && text[i] <= '9') {
+      if(frac_digits >= 7) {
+        return 0;
+      }
+      fractional = fractional * 10 + (uint64_t)(text[i] - '0');
+      scale /= 10;
+      ++frac_digits;
+      ++i;
+    }
+  }
+  if(text[i] != '\0') {
+    return 0;
+  }
+  *value_out = whole * 10000000ULL + fractional * scale;
+  return *value_out != 0;
+}
+
+static void x402_init_dynamic_policy(x402_route_policy *policy)
+{
+  memset(policy, 0, sizeof(*policy));
+  snprintf(policy->resource_method, sizeof(policy->resource_method), "%s", "GET");
+  snprintf(policy->scheme, sizeof(policy->scheme), "%s", "exact");
+  snprintf(policy->mime_type, sizeof(policy->mime_type), "%s", "application/json");
+  snprintf(policy->mechanism, sizeof(policy->mechanism), "%s", "stellar");
+  policy->split_mode = X402_SPLIT_SINGLE;
+  policy->settlement_mode = X402_SETTLEMENT_HYBRID;
+  policy->stellar_local_backend = X402_STELLAR_BACKEND_AUTO;
+  policy->payment_identifier_required = 1;
+  policy->timeout_seconds = 30;
+  snprintf(policy->stellar_rpc_url,
+           sizeof(policy->stellar_rpc_url),
+           "%s",
+           "https://soroban-testnet.stellar.org:443");
+  snprintf(policy->stellar_network_passphrase,
+           sizeof(policy->stellar_network_passphrase),
+           "%s",
+           "Test SDF Network ; September 2015");
+  policy->credits.scope = X402_CREDIT_SCOPE_PAYER_ROUTE;
+}
+
+static int x402_copy_json_string(const char *json,
+                                 const char *key,
+                                 char *target,
+                                 size_t target_size,
+                                 int required)
+{
+  x402_status status;
+
+  if(target == NULL || target_size == 0) {
+    return 0;
+  }
+  status = x402_extract_json_string(json, key, target, target_size);
+  if(status == X402_STATUS_OK) {
+    return 1;
+  }
+  return required ? 0 : 1;
+}
+
+static int x402_build_intent_policy(request_rec *r, const char *body, x402_route_policy *policy)
+{
+  char amount_text[64];
+  const char *policy_error;
+  uint32_t timeout = 0;
+
+  x402_init_dynamic_policy(policy);
+  if(!x402_copy_json_string(body, "resource", policy->route, sizeof(policy->route), 1) ||
+     !x402_copy_json_string(body, "network", policy->network, sizeof(policy->network), 1) ||
+     !x402_copy_json_string(body, "asset", policy->asset, sizeof(policy->asset), 1) ||
+     !x402_copy_json_string(body, "description", policy->description, sizeof(policy->description), 0) ||
+     !x402_copy_json_string(body, "mime_type", policy->mime_type, sizeof(policy->mime_type), 0) ||
+     !x402_copy_json_string(body, "pay_to", policy->pay_to, sizeof(policy->pay_to), 0)) {
+    return 0;
+  }
+  if(policy->description[0] == '\0') {
+    snprintf(policy->description, sizeof(policy->description), "%s", "x402 payment");
+  }
+  if(x402_extract_json_string(body, "amount", amount_text, sizeof(amount_text)) == X402_STATUS_OK) {
+    if(!x402_parse_uint64_string(amount_text, &policy->amount)) {
+      return 0;
+    }
+  }
+  else if(x402_extract_json_string(body, "amount_usdc", amount_text, sizeof(amount_text)) ==
+          X402_STATUS_OK) {
+    if(!x402_parse_usdc_decimal(amount_text, &policy->amount)) {
+      return 0;
+    }
+  }
+  else {
+    return 0;
+  }
+  if(x402_extract_json_uint32(body, "timeout", &timeout) == X402_STATUS_OK && timeout > 0) {
+    policy->timeout_seconds = timeout;
+  }
+
+  policy_error = x402_apply_global_split_policy(r,
+                                                policy,
+                                                policy->pay_to[0] != '\0',
+                                                0,
+                                                0);
+  if(policy_error != NULL) {
+    ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "x402 dynamic policy invalid: %s", policy_error);
+    return 0;
+  }
+  return 1;
+}
+
+static int x402_handle_challenge(request_rec *r)
+{
+  x402_server_config *server_cfg;
+  const x402_provider *provider;
+  x402_route_policy policy;
+  x402_payment_requirements requirements;
+  x402_request_context request;
+  char error[X402_MAX_TEXT];
+  char json[X402_MAX_JSON];
+  char payment_identifier[X402_MAX_IDENTIFIER];
+  char store_id[X402_MAX_IDENTIFIER];
+  char catalog_id[X402_MAX_IDENTIFIER];
+  char order_id[X402_MAX_IDENTIFIER];
+  const char *encoded;
+  char *body = NULL;
+  int status;
+
+  if(r == NULL || r->main != NULL) {
+    return DECLINED;
+  }
+  server_cfg = (x402_server_config *)ap_get_module_config(r->server->module_config,
+                                                          &x402_module);
+  if(server_cfg == NULL || server_cfg->challenge_endpoint[0] == '\0' ||
+     !x402_same_route(server_cfg->challenge_endpoint, r->uri)) {
+    return DECLINED;
+  }
+  x402_strip_trusted_request_headers(r);
+  if(strcmp(r->method, "POST") != 0) {
+    apr_table_setn(r->headers_out, "Allow", "POST");
+    return HTTP_METHOD_NOT_ALLOWED;
+  }
+  status = x402_authorize_intent_request(r, server_cfg);
+  if(status != OK) {
+    return status;
+  }
+  status = x402_read_request_body(r, &body);
+  if(status != OK) {
+    return status;
+  }
+  if(!x402_build_intent_policy(r, body, &policy)) {
+    return HTTP_BAD_REQUEST;
+  }
+  if(x402_extract_json_string(body,
+                              "payment_identifier",
+                              payment_identifier,
+                              sizeof(payment_identifier)) != X402_STATUS_OK ||
+     payment_identifier[0] == '\0') {
+    return HTTP_BAD_REQUEST;
+  }
+  store_id[0] = '\0';
+  catalog_id[0] = '\0';
+  order_id[0] = '\0';
+  x402_extract_json_string(body, "store_id", store_id, sizeof(store_id));
+  x402_extract_json_string(body, "catalog_id", catalog_id, sizeof(catalog_id));
+  x402_extract_json_string(body, "order_id", order_id, sizeof(order_id));
+  provider = x402_get_provider(&policy);
+  if(provider == NULL) {
+    ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "no x402 provider for mechanism %s",
+                  policy.mechanism);
+    return HTTP_BAD_REQUEST;
+  }
+  status = x402_validate_policy(&policy, error, sizeof(error));
+  if(status != X402_STATUS_OK) {
+    ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "x402 dynamic policy invalid: %s", error);
+    return HTTP_BAD_REQUEST;
+  }
+  memset(&request, 0, sizeof(request));
+  snprintf(request.request_id, sizeof(request.request_id), "%ld", (long)r->request_time);
+  snprintf(request.client_id,
+           sizeof(request.client_id),
+           "%s",
+           r->useragent_ip == NULL ? "unknown" : r->useragent_ip);
+  status = provider->declare_requirements(&policy, &request, &requirements);
+  if(status != X402_STATUS_OK) {
+    ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "x402 dynamic requirements failed");
+    return HTTP_INTERNAL_SERVER_ERROR;
+  }
+  status = x402_build_payment_required_json(&policy, &requirements, json, sizeof(json));
+  if(status != X402_STATUS_OK) {
+    ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "x402 dynamic challenge build failed");
+    return HTTP_INTERNAL_SERVER_ERROR;
+  }
+  if(!x402_dynamic_intent_store(r, &policy, payment_identifier, store_id, catalog_id, order_id)) {
+    ap_log_rerror(APLOG_MARK,
+                  APLOG_ERR,
+                  0,
+                  r,
+                  "x402 dynamic intent store failed: payment_id=%s",
+                  payment_identifier);
+    return HTTP_INTERNAL_SERVER_ERROR;
+  }
+  encoded = x402_encode_header_value(r->pool, json);
+  apr_table_setn(r->headers_out, "PAYMENT-REQUIRED", encoded);
+  ap_set_content_type(r, "application/json");
+  ap_rprintf(r,
+             "{\"paymentRequired\":\"%s\",\"paymentIdentifier\":\"%s\"}\n",
+             encoded,
+             payment_identifier);
+  return OK;
+}
+
+static int x402_handle_dynamic_checkout(request_rec *r)
+{
+  x402_server_config *server_cfg;
+  const x402_provider *provider;
+  x402_route_policy policy;
+  x402_payment_payload_view payload;
+  x402_request_context request;
+  x402_verification_result verification;
+  x402_settlement_result settlement;
+  char response_json[X402_MAX_JSON];
+  char error[X402_MAX_TEXT];
+  char intent_status[32];
+  const char *signature;
+  const char *decode_error;
+  char *decoded = NULL;
+  x402_status status;
+
+  if(r == NULL || r->main != NULL) {
+    return DECLINED;
+  }
+  server_cfg = (x402_server_config *)ap_get_module_config(r->server->module_config,
+                                                          &x402_module);
+  if(server_cfg == NULL || server_cfg->dynamic_checkout_endpoint[0] == '\0' ||
+     !x402_same_route(server_cfg->dynamic_checkout_endpoint, r->uri)) {
+    return DECLINED;
+  }
+
+  x402_strip_trusted_request_headers(r);
+  x402_credit_db_cleanup_expired(r->server);
+  signature = apr_table_get(r->headers_in, "PAYMENT-SIGNATURE");
+  if(signature == NULL || signature[0] == '\0') {
+    ap_set_content_type(r, "application/json");
+    ap_rputs("{\"error\":\"payment_required\",\"message\":\"dynamic checkout requires PAYMENT-SIGNATURE\"}\n", r);
+    return HTTP_PAYMENT_REQUIRED;
+  }
+
+  decode_error = x402_decode_signature(r, signature, r->pool, &decoded);
+  if(decode_error != NULL) {
+    ap_log_rerror(APLOG_MARK, APLOG_WARNING, 0, r, "x402 dynamic decode error: %s", decode_error);
+    return HTTP_BAD_REQUEST;
+  }
+
+  memset(&payload, 0, sizeof(payload));
+  x402_parse_payment_payload(decoded, &payload);
+  if(payload.payment_identifier[0] == '\0') {
+    return HTTP_BAD_REQUEST;
+  }
+  intent_status[0] = '\0';
+  if(!x402_dynamic_intent_load(r, payload.payment_identifier, &policy, intent_status, sizeof(intent_status)) ||
+     !x402_same_route(policy.route, r->uri)) {
+    ap_log_rerror(APLOG_MARK,
+                  APLOG_WARNING,
+                  0,
+                  r,
+                  "x402 dynamic intent missing or route mismatch: payment_id=%s route=%s",
+                  payload.payment_identifier,
+                  r->uri == NULL ? "(null)" : r->uri);
+    return HTTP_NOT_FOUND;
+  }
+  if(strcmp(intent_status, "settled") == 0) {
+    return HTTP_CONFLICT;
+  }
+  if(strcmp(intent_status, "pending") != 0) {
+    return HTTP_CONFLICT;
+  }
+  if(!x402_dynamic_intent_set_status(r,
+                                     payload.payment_identifier,
+                                     "pending",
+                                     "settling",
+                                     NULL,
+                                     NULL)) {
+    return HTTP_CONFLICT;
+  }
+
+  provider = x402_get_provider(&policy);
+  if(provider == NULL) {
+    x402_dynamic_intent_set_status(r, payload.payment_identifier, "settling", "pending", NULL, NULL);
+    return HTTP_BAD_REQUEST;
+  }
+  status = x402_validate_policy(&policy, error, sizeof(error));
+  if(status != X402_STATUS_OK) {
+    ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "x402 dynamic checkout policy invalid: %s", error);
+    x402_dynamic_intent_set_status(r, payload.payment_identifier, "settling", "pending", NULL, NULL);
+    return HTTP_BAD_REQUEST;
+  }
+
+  x402_fill_request_context(&request, r, &policy, &payload);
+  status = provider->verify(&policy, &request, decoded, &verification);
+  if(status != X402_STATUS_OK || !verification.accepted) {
+    ap_log_rerror(APLOG_MARK,
+                  APLOG_WARNING,
+                  0,
+                  r,
+                  "x402 dynamic verify failed: payment_id=%s message=%s",
+                  payload.payment_identifier,
+                  verification.message);
+    x402_dynamic_intent_set_status(r, payload.payment_identifier, "settling", "pending", NULL, NULL);
+    return HTTP_PAYMENT_REQUIRED;
+  }
+
+  status = provider->settle(&policy, &request, decoded, &settlement);
+  if(status != X402_STATUS_OK || !settlement.settled) {
+    ap_log_rerror(APLOG_MARK,
+                  APLOG_WARNING,
+                  0,
+                  r,
+                  "x402 dynamic settle failed: payment_id=%s message=%s",
+                  payload.payment_identifier,
+                  settlement.message);
+    x402_dynamic_intent_set_status(r, payload.payment_identifier, "settling", "pending", NULL, NULL);
+    return HTTP_PAYMENT_REQUIRED;
+  }
+  if(!x402_dynamic_intent_set_status(r,
+                                     payload.payment_identifier,
+                                     "settling",
+                                     "settled",
+                                     settlement.payer,
+                                     settlement.transaction_ref)) {
+    return HTTP_CONFLICT;
+  }
+
+  status = x402_build_payment_response_json(&policy, &settlement, response_json, sizeof(response_json));
+  if(status != X402_STATUS_OK) {
+    return HTTP_INTERNAL_SERVER_ERROR;
+  }
+  apr_table_setn(r->notes, "x402-settled", "1");
+  apr_table_setn(r->notes, "x402-payer", apr_pstrdup(r->pool, settlement.payer));
+  x402_set_trusted_payment_headers(r,
+                                   settlement.payer,
+                                   settlement.transaction_ref,
+                                   x402_effective_payment_amount(&policy, &request),
+                                   request.payment_identifier,
+                                   settlement.settlement_mode);
+  apr_table_setn(r->headers_out,
+                 "PAYMENT-RESPONSE",
+                 x402_encode_header_value(r->pool, response_json));
+  if(settlement.split_transaction_hash[0] != '\0') {
+    apr_table_setn(r->headers_out,
+                   "X402-Split-Transaction-Hash",
+                   apr_pstrdup(r->pool, settlement.split_transaction_hash));
+  }
+  x402_log_syslog_proof("dynamic-response-released",
+                        request.payment_identifier,
+                        settlement.payer,
+                        r->uri,
+                        settlement.transaction_ref);
+  x402_trace_async_split(r,
+                         request.payment_identifier,
+                         "dynamic-response-released",
+                         settlement.transaction_ref);
+  return DECLINED;
 }
 
 static int x402_same_route(const char *left, const char *right)
@@ -2098,8 +3030,16 @@ static int x402_check_access(request_rec *r)
   const char *forward_auth_challenge;
   const char *forward_proof_response_released;
   const char *forward_split_transaction_hash;
+  const char *forward_transaction;
+  const char *forward_amount;
+  const char *forward_settlement_mode;
 
-  if(cfg == NULL || !cfg->enabled || r->main != NULL) {
+  if(cfg == NULL || r->main != NULL) {
+    return DECLINED;
+  }
+
+  x402_strip_trusted_request_headers(r);
+  if(!cfg->enabled) {
     return DECLINED;
   }
 
@@ -2123,6 +3063,9 @@ static int x402_check_access(request_rec *r)
   forward_auth_challenge = x402_forward_note(r, "x402-forward-auth-challenge");
   forward_proof_response_released = x402_forward_note(r, "x402-forward-proof-response-released");
   forward_split_transaction_hash = x402_forward_note(r, "x402-forward-split-transaction-hash");
+  forward_transaction = x402_forward_note(r, "x402-forward-transaction");
+  forward_amount = x402_forward_note(r, "x402-forward-amount");
+  forward_settlement_mode = x402_forward_note(r, "x402-forward-settlement-mode");
   if(forward_payment_response != NULL &&
      (forward_target == NULL || x402_same_route(forward_target, r->uri) || r->prev != NULL)) {
     if(forward_auth_challenge != NULL) {
@@ -2152,6 +3095,12 @@ static int x402_check_access(request_rec *r)
     if(forward_payer != NULL) {
       apr_table_setn(r->notes, "x402-payer", forward_payer);
     }
+    x402_set_trusted_payment_headers(r,
+                                     forward_payer,
+                                     forward_transaction,
+                                     forward_amount == NULL ? 0 : apr_atoi64(forward_amount),
+                                     x402_forward_note(r, "x402-payment-identifier"),
+                                     forward_settlement_mode);
     ap_log_rerror(APLOG_MARK,
                   APLOG_NOTICE,
                   0,
@@ -2307,6 +3256,12 @@ static int x402_check_access(request_rec *r)
 
   apr_table_setn(r->notes, "x402-settled", "1");
   apr_table_setn(r->notes, "x402-payer", apr_pstrdup(r->pool, settlement.payer));
+  x402_set_trusted_payment_headers(r,
+                                   settlement.payer,
+                                   settlement.transaction_ref,
+                                   x402_effective_payment_amount(&cfg->policy, &request),
+                                   request.payment_identifier,
+                                   settlement.settlement_mode);
   ap_log_rerror(APLOG_MARK,
                 APLOG_NOTICE,
                 0,
@@ -2370,6 +3325,17 @@ static int x402_check_access(request_rec *r)
     apr_table_setn(r->notes,
                    "x402-forward-split-transaction-hash",
                    apr_pstrdup(r->pool, settlement.split_transaction_hash));
+    apr_table_setn(r->notes,
+                   "x402-forward-transaction",
+                   apr_pstrdup(r->pool, settlement.transaction_ref));
+    apr_table_setn(r->notes,
+                   "x402-forward-amount",
+                   apr_psprintf(r->pool,
+                                "%" PRIu64,
+                                x402_effective_payment_amount(&cfg->policy, &request)));
+    apr_table_setn(r->notes,
+                   "x402-forward-settlement-mode",
+                   apr_pstrdup(r->pool, settlement.settlement_mode));
     ap_internal_redirect(cfg->policy.forward_to, r);
     return OK;
   }
@@ -2482,6 +3448,21 @@ static const command_rec x402_cmds[] = {
                   NULL,
                   RSRC_CONF,
                   "sqlite database path for durable prepaid credits"),
+    AP_INIT_TAKE1("X402ChallengeEndpoint",
+                  x402_cmd_challenge_endpoint,
+                  NULL,
+                  RSRC_CONF,
+                  "server-wide authenticated dynamic challenge endpoint path"),
+    AP_INIT_TAKE1("X402DynamicCheckoutEndpoint",
+                  x402_cmd_dynamic_checkout_endpoint,
+                  NULL,
+                  RSRC_CONF,
+                  "server-wide dynamic checkout endpoint path"),
+    AP_INIT_TAKE1("X402IntentSecretFile",
+                  x402_cmd_intent_secret_file,
+                  NULL,
+                  RSRC_CONF,
+                  "path to shared secret for authenticated dynamic payment intents"),
     {NULL}};
 
 static void x402_child_init(apr_pool_t *pool, server_rec *server)
@@ -2514,6 +3495,8 @@ static void x402_register_hooks(apr_pool_t *pool)
   (void)pool;
   ap_hook_post_config(x402_post_config, NULL, NULL, APR_HOOK_MIDDLE);
   ap_hook_child_init(x402_child_init, NULL, NULL, APR_HOOK_MIDDLE);
+  ap_hook_handler(x402_handle_dynamic_checkout, NULL, NULL, APR_HOOK_MIDDLE);
+  ap_hook_handler(x402_handle_challenge, NULL, NULL, APR_HOOK_MIDDLE);
   ap_hook_access_checker(x402_check_access, NULL, NULL, APR_HOOK_MIDDLE);
 }
 
