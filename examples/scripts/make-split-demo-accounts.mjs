@@ -28,10 +28,14 @@ const defaults = {
   splitterContract:
     process.env.X402_SPLITTER_CONTRACT || "CCTVCH6BUWS4XESFHK4BHKK35KY56PQ5PGSIQHKJBNYMTWXXGXLYKMBD",
   sourceAccountName: process.env.X402_STELLAR_SOURCE_ACCOUNT || "operator_demo_split",
-  splitStakeholderOneName: process.env.X402_STAKEHOLDER_1_NAME || "server",
-  splitStakeholderOneBps: process.env.X402_STAKEHOLDER_1_BPS || "7000",
-  splitStakeholderTwoName: process.env.X402_STAKEHOLDER_2_NAME || "creator",
-  splitStakeholderTwoBps: process.env.X402_STAKEHOLDER_2_BPS || "3000",
+  operatorStakeholderName:
+    process.env.X402_OPERATOR_STAKEHOLDER_1_NAME || process.env.X402_STAKEHOLDER_1_NAME || "server",
+  operatorStakeholderBps:
+    process.env.X402_OPERATOR_STAKEHOLDER_1_BPS || process.env.X402_STAKEHOLDER_1_BPS || "7000",
+  publisherStakeholderName:
+    process.env.X402_PUBLISHER_STAKEHOLDER_1_NAME || process.env.X402_STAKEHOLDER_2_NAME || "creator",
+  publisherStakeholderBps:
+    process.env.X402_PUBLISHER_STAKEHOLDER_1_BPS || process.env.X402_STAKEHOLDER_2_BPS || "3000",
 };
 
 const networkPassphrase =
@@ -168,12 +172,12 @@ async function main() {
     X402_ENABLE_SPLIT: "1",
     X402_STELLAR_SOURCE_ACCOUNT: defaults.sourceAccountName,
     X402_SPLITTER_CONTRACT: defaults.splitterContract,
-    X402_STAKEHOLDER_1_NAME: defaults.splitStakeholderOneName,
-    X402_STAKEHOLDER_1_BPS: defaults.splitStakeholderOneBps,
-    X402_STAKEHOLDER_1_DEST: server.publicKey,
-    X402_STAKEHOLDER_2_NAME: defaults.splitStakeholderTwoName,
-    X402_STAKEHOLDER_2_BPS: defaults.splitStakeholderTwoBps,
-    X402_STAKEHOLDER_2_DEST: creator.publicKey,
+    X402_OPERATOR_STAKEHOLDER_1_NAME: defaults.operatorStakeholderName,
+    X402_OPERATOR_STAKEHOLDER_1_BPS: defaults.operatorStakeholderBps,
+    X402_OPERATOR_STAKEHOLDER_1_DEST: server.publicKey,
+    X402_PUBLISHER_STAKEHOLDER_1_NAME: defaults.publisherStakeholderName,
+    X402_PUBLISHER_STAKEHOLDER_1_BPS: defaults.publisherStakeholderBps,
+    X402_PUBLISHER_STAKEHOLDER_1_DEST: creator.publicKey,
     X402_STELLAR_RPC_URL: process.env.X402_STELLAR_RPC_URL || "https://soroban-testnet.stellar.org:443",
     X402_STELLAR_NETWORK_PASSPHRASE:
       process.env.X402_STELLAR_NETWORK_PASSPHRASE || "Test SDF Network ; September 2015",

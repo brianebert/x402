@@ -12,4 +12,4 @@ This directory contains operator-facing scripts for inspecting and demoing x402 
   Negative-test helper for bad-payment handling. It creates a random Stellar keypair, prints the public key under test, and sends ten parseable but deliberately invalid payer-bearing payment payloads so operators can exercise `402` and `429` behavior deterministically.
 
 - `make-split-demo-accounts.mjs`
-  Creates or reuses the demo accounts needed for split-payment testing and writes the generated `.env`, identity, and account metadata artifacts.
+  Creates or reuses the demo accounts needed for split-payment testing and writes the generated `.env`, identity, and account metadata artifacts. The generated `split-server.env` uses indexed `X402_OPERATOR_STAKEHOLDER_1_*` and `X402_PUBLISHER_STAKEHOLDER_1_*` variables.
