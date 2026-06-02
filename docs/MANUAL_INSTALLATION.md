@@ -1,6 +1,6 @@
 # Manual Installation
 
-This guide is for an operator who wants to install and configure the Apache `x402+` module without using `scripts/host-admin-install.sh`.
+This guide is for an operator who wants to install and configure the Apache `x402+` module without using the installer scripts.
 
 It covers:
 
@@ -15,6 +15,12 @@ This guide assumes:
 - Ubuntu or another Apache 2.4 host with similar paths
 - a working repo checkout at `/srv/x402`
 - Stellar testnet usage
+
+Installer equivalents:
+
+- `scripts/host-system-install.sh` performs package install, module build/install, runtime directory setup, facilitator key install, split signer install, and `/etc/apache2/conf-available/x402-splits.conf` generation.
+- `scripts/host-vhost-install.sh` creates document roots and Apache vhost/route config.
+- `scripts/host-admin-install.sh` is a compatibility wrapper that runs both phases in order.
 
 ## 1. Build Prerequisites
 
@@ -300,7 +306,25 @@ Use route-specific publisher stakeholders when one generated route needs a diffe
 - `X402_ROUTE_PRICEX10_STAKEHOLDER_1_*`
 - `X402_ROUTE_PRICEX100_STAKEHOLDER_1_*`
 
-The compatibility variables `X402_STAKEHOLDER_1_*` and `X402_STAKEHOLDER_2_*` still map to operator and publisher respectively.
+For custom indexed routes, use the route index:
+
+- `X402_ROUTE_1_STAKEHOLDER_1_NAME`
+- `X402_ROUTE_1_STAKEHOLDER_1_BPS`
+- `X402_ROUTE_1_STAKEHOLDER_1_DEST`
+
+The compatibility variables `X402_STAKEHOLDER_1_*` and `X402_STAKEHOLDER_2_*` still map to operator and publisher respectively. With the installers, `host-system-install.sh` emits the operator-owned systemwide stakeholder lines and `host-vhost-install.sh` emits route or publisher stakeholder lines in the site config.
+
+The vhost installer also supports indexed route generation:
+
+- `X402_ROUTE_COUNT`
+- `X402_ROUTE_1_PATH`
+- `X402_ROUTE_1_AMOUNT`
+- `X402_ROUTE_1_DESCRIPTION`
+- `X402_ROUTE_1_MIMETYPE`
+- `X402_ROUTE_1_CREDITS_ISSUED`
+- `X402_ROUTE_1_FORWARD_TO`
+- `X402_ROUTE_1_CONTENT_FILE`
+- `X402_ROUTE_1_CONTENT_BODY`
 
 For split settlement, replace the single-recipient route directive:
 

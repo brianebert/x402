@@ -43,6 +43,7 @@ make
 To build and install the Apache module, use either:
 
 - `scripts/host-admin-install.sh`
+- `scripts/host-system-install.sh`
 - the manual compile/link commands in [docs/MANUAL_INSTALLATION.md](docs/MANUAL_INSTALLATION.md)
 
 ## Deploy
@@ -55,12 +56,22 @@ Active host layout:
 - credit DB: `/var/lib/x402/credits.db`
 - Stellar config dir: `/etc/apache2/x402-stellar`
 
-Canonical install/update path:
+One-command install/update path:
 
 ```sh
 cd /srv/x402
 sudo X402_ENV_FILE=/srv/x402/.env ./scripts/host-admin-install.sh
 ```
+
+Split install/update path:
+
+```sh
+cd /srv/x402
+sudo X402_ENV_FILE=/srv/x402/.env ./scripts/host-system-install.sh
+sudo X402_ENV_FILE=/srv/x402/.env ./scripts/host-vhost-install.sh
+```
+
+Use `host-system-install.sh` when changing packages, rebuilding the module, changing facilitator state, or changing systemwide split policy in `/etc/apache2/conf-available/x402-splits.conf`. Use `host-vhost-install.sh` when changing generated vhost, route, document-root, TLS, or publisher stakeholder config.
 
 If you need a hard module refresh after changing C/C++ code, prefer a full Apache restart:
 
@@ -122,7 +133,27 @@ Route-specific publisher stakeholders override the default publisher list for on
 - `X402_ROUTE_PRICEX10_STAKEHOLDER_1_*`
 - `X402_ROUTE_PRICEX100_STAKEHOLDER_1_*`
 
+For custom indexed routes, use the route index instead:
+
+- `X402_ROUTE_1_STAKEHOLDER_1_NAME`
+- `X402_ROUTE_1_STAKEHOLDER_1_BPS`
+- `X402_ROUTE_1_STAKEHOLDER_1_DEST`
+
 For compatibility, `X402_STAKEHOLDER_1_*` maps to the operator stakeholder and `X402_STAKEHOLDER_2_*` maps to the publisher stakeholder.
+
+The generated route family can be replaced with indexed route variables:
+
+- `X402_ROUTE_COUNT`
+- `X402_ROUTE_1_PATH`
+- `X402_ROUTE_1_AMOUNT`
+- `X402_ROUTE_1_DESCRIPTION`
+- `X402_ROUTE_1_MIMETYPE`
+- `X402_ROUTE_1_CREDITS_ISSUED`
+- `X402_ROUTE_1_FORWARD_TO`
+- `X402_ROUTE_1_CONTENT_FILE`
+- `X402_ROUTE_1_CONTENT_BODY`
+
+When `X402_ROUTE_COUNT` is omitted, the installer emits `/app/foo`, `/price`, `/priceX2`, `/priceX10`, and `/priceX100`.
 
 Facilitator bearer keys should be file-backed:
 

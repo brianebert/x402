@@ -204,7 +204,8 @@ async function main() {
   console.log(
     `2. Install ${identityPath} as /etc/apache2/x402-stellar/identity/${defaults.sourceAccountName}.toml`
   );
-  console.log("3. Rerun ./scripts/host-admin-install.sh on the host");
+  console.log("3. Run ./scripts/host-system-install.sh, then ./scripts/host-vhost-install.sh");
+  console.log("   Or run ./scripts/host-admin-install.sh to execute both phases");
   console.log("\nAccount summary:");
   console.log(`buyer: ${buyer.publicKey}`);
   console.log(`server: ${server.publicKey}`);

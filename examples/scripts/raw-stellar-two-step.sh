@@ -13,8 +13,8 @@ Environment:
 
 Examples:
   STELLAR_PRIVATE_KEY='S...' ./scripts/raw-stellar-two-step.sh
-  STELLAR_PRIVATE_KEY='S...' ./scripts/raw-stellar-two-step.sh 143.198.231.193
-  STELLAR_PRIVATE_KEY='S...' ./scripts/raw-stellar-two-step.sh http://143.198.231.193/app/foo/
+  STELLAR_PRIVATE_KEY='S...' ./scripts/raw-stellar-two-step.sh 165.232.52.126
+  STELLAR_PRIVATE_KEY='S...' ./scripts/raw-stellar-two-step.sh http://165.232.52.126/app/foo/
 EOF
 }
 
@@ -28,7 +28,7 @@ if [ -z "${STELLAR_PRIVATE_KEY:-}" ]; then
   exit 1
 fi
 
-TARGET="${1:-143.198.231.193}"
+TARGET="${1:-165.232.52.126}"
 case "$TARGET" in
   http://*|https://*)
     URL="$TARGET"
