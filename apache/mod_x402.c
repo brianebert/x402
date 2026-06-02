@@ -36,13 +36,96 @@ extern module AP_MODULE_DECLARE_DATA x402_module;
 
 typedef struct x402_dir_config {
   int enabled;
+  int pay_to_set;
+  int split_mode_set;
+  int splitter_contract_set;
   x402_route_policy policy;
 } x402_dir_config;
+
+typedef struct x402_server_config {
+  int split_mode_set;
+  x402_split_mode split_mode;
+  int splitter_contract_set;
+  char splitter_contract[X402_MAX_DESTINATION];
+  int stakeholder_overflow;
+  size_t stakeholder_count;
+  x402_stakeholder stakeholders[X402_MAX_STAKEHOLDERS];
+} x402_server_config;
 static apr_thread_mutex_t *x402_credit_mutex = NULL;
 static sqlite3 *x402_credit_db = NULL;
 static char x402_credit_db_path[X402_MAX_PATH] = X402_DEFAULT_CREDIT_DB_PATH;
 static sqlite3_int64 x402_credit_db_last_cleanup = 0;
 static int x402_same_route(const char *left, const char *right);
+
+static int x402_server_has_global_split(const x402_server_config *cfg)
+{
+  return cfg != NULL && cfg->split_mode_set && cfg->split_mode == X402_SPLIT_MULTI;
+}
+
+static const char *x402_apply_global_split_policy(request_rec *r,
+                                                  x402_route_policy *policy,
+                                                  int route_pay_to_set,
+                                                  int route_split_mode_set,
+                                                  int route_splitter_contract_set)
+{
+  x402_server_config *server_cfg;
+  x402_stakeholder route_stakeholders[X402_MAX_STAKEHOLDERS];
+  size_t route_stakeholder_count;
+  size_t i;
+
+  if(r == NULL || policy == NULL) {
+    return NULL;
+  }
+
+  server_cfg = (x402_server_config *)ap_get_module_config(r->server->module_config,
+                                                          &x402_module);
+  if(!x402_server_has_global_split(server_cfg)) {
+    return NULL;
+  }
+  if(server_cfg->stakeholder_overflow) {
+    return "too many stakeholders after merging systemwide and vhost split policy";
+  }
+
+  route_stakeholder_count = policy->stakeholder_count;
+  if(route_stakeholder_count > X402_MAX_STAKEHOLDERS) {
+    route_stakeholder_count = X402_MAX_STAKEHOLDERS;
+  }
+  memcpy(route_stakeholders,
+         policy->stakeholders,
+         route_stakeholder_count * sizeof(route_stakeholders[0]));
+
+  if(route_pay_to_set || route_split_mode_set || route_splitter_contract_set) {
+    ap_log_rerror(APLOG_MARK,
+                  APLOG_WARNING,
+                  0,
+                  r,
+                  "x402: systemwide split policy overrides route pay-to/split mode/contract for %s",
+                  policy->route[0] == '\0' ? r->uri : policy->route);
+  }
+
+  policy->split_mode = X402_SPLIT_MULTI;
+  policy->pay_to[0] = '\0';
+  snprintf(policy->splitter_contract,
+           sizeof(policy->splitter_contract),
+           "%s",
+           server_cfg->splitter_contract);
+  policy->stakeholder_count = 0;
+
+  for(i = 0; i < server_cfg->stakeholder_count; ++i) {
+    if(policy->stakeholder_count >= X402_MAX_STAKEHOLDERS) {
+      return "too many stakeholders after applying systemwide split policy";
+    }
+    policy->stakeholders[policy->stakeholder_count++] = server_cfg->stakeholders[i];
+  }
+  for(i = 0; i < route_stakeholder_count; ++i) {
+    if(policy->stakeholder_count >= X402_MAX_STAKEHOLDERS) {
+      return "too many stakeholders after applying systemwide split policy";
+    }
+    policy->stakeholders[policy->stakeholder_count++] = route_stakeholders[i];
+  }
+
+  return NULL;
+}
 
 #define X402_STELLAR_AUTH_HEADER "X402-Stellar-Auth"
 #define X402_STELLAR_AUTH_CHALLENGE_HEADER "X402-Stellar-Auth-Challenge"
@@ -214,6 +297,46 @@ static void *x402_merge_dir_config(apr_pool_t *pool, void *basev, void *addv)
 
   if(add->enabled) {
     *merged = *add;
+  }
+
+  return merged;
+}
+
+static void *x402_create_server_config(apr_pool_t *pool, server_rec *server)
+{
+  x402_server_config *cfg = (x402_server_config *)apr_pcalloc(pool, sizeof(*cfg));
+
+  (void)server;
+  cfg->split_mode = X402_SPLIT_SINGLE;
+  return cfg;
+}
+
+static void *x402_merge_server_config(apr_pool_t *pool, void *basev, void *addv)
+{
+  x402_server_config *base = (x402_server_config *)basev;
+  x402_server_config *add = (x402_server_config *)addv;
+  x402_server_config *merged = (x402_server_config *)apr_pcalloc(pool, sizeof(*merged));
+  size_t i;
+
+  *merged = *base;
+  if(add->split_mode_set) {
+    merged->split_mode_set = add->split_mode_set;
+    merged->split_mode = add->split_mode;
+  }
+  if(add->splitter_contract_set) {
+    merged->splitter_contract_set = add->splitter_contract_set;
+    snprintf(merged->splitter_contract,
+             sizeof(merged->splitter_contract),
+             "%s",
+             add->splitter_contract);
+  }
+  merged->stakeholder_overflow = base->stakeholder_overflow || add->stakeholder_overflow;
+  for(i = 0; i < add->stakeholder_count; ++i) {
+    if(merged->stakeholder_count >= X402_MAX_STAKEHOLDERS) {
+      merged->stakeholder_overflow = 1;
+      continue;
+    }
+    merged->stakeholders[merged->stakeholder_count++] = add->stakeholders[i];
   }
 
   return merged;
@@ -478,15 +601,43 @@ static const char *x402_cmd_payment_identifier(cmd_parms *cmd, void *cfgv, const
 
 static const char *x402_cmd_pay_to(cmd_parms *cmd, void *cfgv, const char *arg)
 {
+  x402_server_config *server_cfg;
   x402_dir_config *cfg = (x402_dir_config *)cfgv;
-  (void)cmd;
+
+  server_cfg = (x402_server_config *)ap_get_module_config(cmd->server->module_config,
+                                                          &x402_module);
+  if(x402_server_has_global_split(server_cfg)) {
+    return "X402PayTo cannot be set inside a route when a systemwide split policy is configured";
+  }
+  cfg->pay_to_set = 1;
   return x402_set_string(cfg->policy.pay_to, sizeof(cfg->policy.pay_to), arg);
 }
 
 static const char *x402_cmd_split_mode(cmd_parms *cmd, void *cfgv, const char *arg)
 {
+  x402_server_config *server_cfg;
   x402_dir_config *cfg = (x402_dir_config *)cfgv;
-  (void)cmd;
+
+  if(cmd->path == NULL) {
+    server_cfg = (x402_server_config *)ap_get_module_config(cmd->server->module_config,
+                                                            &x402_module);
+    if(cmd->server->is_virtual) {
+      return "X402SplitMode is only allowed in serverwide config or route/location config";
+    }
+    if(strcmp(arg, "multi") != 0) {
+      return "systemwide X402SplitMode must be multi";
+    }
+    server_cfg->split_mode_set = 1;
+    server_cfg->split_mode = X402_SPLIT_MULTI;
+    return NULL;
+  }
+
+  server_cfg = (x402_server_config *)ap_get_module_config(cmd->server->module_config,
+                                                          &x402_module);
+  if(x402_server_has_global_split(server_cfg)) {
+    return "X402SplitMode cannot be set inside a route when a systemwide split policy is configured";
+  }
+
   if(strcmp(arg, "single") == 0) {
     cfg->policy.split_mode = X402_SPLIT_SINGLE;
   }
@@ -496,13 +647,33 @@ static const char *x402_cmd_split_mode(cmd_parms *cmd, void *cfgv, const char *a
   else {
     return "X402SplitMode must be single or multi";
   }
+  cfg->split_mode_set = 1;
   return NULL;
 }
 
 static const char *x402_cmd_splitter_contract(cmd_parms *cmd, void *cfgv, const char *arg)
 {
+  x402_server_config *server_cfg;
   x402_dir_config *cfg = (x402_dir_config *)cfgv;
-  (void)cmd;
+
+  if(cmd->path == NULL) {
+    server_cfg = (x402_server_config *)ap_get_module_config(cmd->server->module_config,
+                                                            &x402_module);
+    if(cmd->server->is_virtual) {
+      return "X402SplitterContract is only allowed in serverwide config or route/location config";
+    }
+    server_cfg->splitter_contract_set = 1;
+    return x402_set_string(server_cfg->splitter_contract,
+                           sizeof(server_cfg->splitter_contract),
+                           arg);
+  }
+
+  server_cfg = (x402_server_config *)ap_get_module_config(cmd->server->module_config,
+                                                          &x402_module);
+  if(x402_server_has_global_split(server_cfg)) {
+    return "X402SplitterContract cannot be set inside a route when a systemwide split policy is configured";
+  }
+  cfg->splitter_contract_set = 1;
   return x402_set_string(cfg->policy.splitter_contract,
                          sizeof(cfg->policy.splitter_contract),
                          arg);
@@ -515,30 +686,45 @@ static const char *x402_cmd_stakeholder(cmd_parms *cmd,
                                         const char *destination)
 {
   char *endptr = NULL;
+  x402_server_config *server_cfg;
   x402_dir_config *cfg = (x402_dir_config *)cfgv;
   unsigned long value;
-  size_t index = cfg->policy.stakeholder_count;
-
-  (void)cmd;
-  if(index >= X402_MAX_STAKEHOLDERS) {
-    return "too many X402Stakeholder directives";
-  }
+  x402_stakeholder *stakeholder;
+  size_t index;
 
   value = strtoul(bps, &endptr, 10);
   if(endptr == bps || *endptr != '\0' || value > 10000) {
     return "X402Stakeholder basis points must be an integer between 0 and 10000";
   }
 
-  snprintf(cfg->policy.stakeholders[index].name,
-           sizeof(cfg->policy.stakeholders[index].name),
+  if(cmd->path == NULL) {
+    server_cfg = (x402_server_config *)ap_get_module_config(cmd->server->module_config,
+                                                            &x402_module);
+    index = server_cfg->stakeholder_count;
+    if(index >= X402_MAX_STAKEHOLDERS) {
+      return "too many X402Stakeholder directives";
+    }
+    stakeholder = &server_cfg->stakeholders[index];
+    server_cfg->stakeholder_count++;
+  }
+  else {
+    index = cfg->policy.stakeholder_count;
+    if(index >= X402_MAX_STAKEHOLDERS) {
+      return "too many X402Stakeholder directives";
+    }
+    stakeholder = &cfg->policy.stakeholders[index];
+    cfg->policy.stakeholder_count++;
+  }
+
+  snprintf(stakeholder->name,
+           sizeof(stakeholder->name),
            "%s",
            name);
-  cfg->policy.stakeholders[index].basis_points = (uint16_t)value;
-  snprintf(cfg->policy.stakeholders[index].destination,
-           sizeof(cfg->policy.stakeholders[index].destination),
+  stakeholder->basis_points = (uint16_t)value;
+  snprintf(stakeholder->destination,
+           sizeof(stakeholder->destination),
            "%s",
            destination);
-  cfg->policy.stakeholder_count++;
   return NULL;
 }
 
@@ -1896,6 +2082,8 @@ static int x402_check_access(request_rec *r)
   const char *decode_error;
   x402_dir_config *cfg = (x402_dir_config *)ap_get_module_config(r->per_dir_config,
                                                                  &x402_module);
+  x402_dir_config effective_cfg;
+  const char *policy_error;
   const x402_provider *provider;
   x402_payment_payload_view payload;
   x402_request_context request;
@@ -1914,6 +2102,18 @@ static int x402_check_access(request_rec *r)
   if(cfg == NULL || !cfg->enabled || r->main != NULL) {
     return DECLINED;
   }
+
+  effective_cfg = *cfg;
+  policy_error = x402_apply_global_split_policy(r,
+                                                &effective_cfg.policy,
+                                                cfg->pay_to_set,
+                                                cfg->split_mode_set,
+                                                cfg->splitter_contract_set);
+  if(policy_error != NULL) {
+    ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "x402 policy invalid: %s", policy_error);
+    return HTTP_INTERNAL_SERVER_ERROR;
+  }
+  cfg = &effective_cfg;
 
   x402_credit_db_cleanup_expired(r->server);
 
@@ -2244,16 +2444,16 @@ static const command_rec x402_cmds[] = {
                   OR_AUTHCFG,
                   "payment identifier policy"),
     AP_INIT_TAKE1("X402PayTo", x402_cmd_pay_to, NULL, OR_AUTHCFG, "recipient"),
-    AP_INIT_TAKE1("X402SplitMode", x402_cmd_split_mode, NULL, OR_AUTHCFG, "split mode"),
+    AP_INIT_TAKE1("X402SplitMode", x402_cmd_split_mode, NULL, OR_AUTHCFG | RSRC_CONF, "split mode"),
     AP_INIT_TAKE1("X402SplitterContract",
                   x402_cmd_splitter_contract,
                   NULL,
-                  OR_AUTHCFG,
+                  OR_AUTHCFG | RSRC_CONF,
                   "splitter contract"),
     AP_INIT_TAKE3("X402Stakeholder",
                   x402_cmd_stakeholder,
                   NULL,
-                  OR_AUTHCFG,
+                  OR_AUTHCFG | RSRC_CONF,
                   "stakeholder name, basis points, destination"),
     AP_INIT_FLAG("X402Prepay", x402_cmd_prepay, NULL, OR_AUTHCFG, "enable prepaid requests"),
     AP_INIT_TAKE1("X402PrepayMultiplierMax",
@@ -2321,8 +2521,8 @@ module AP_MODULE_DECLARE_DATA x402_module = {
     STANDARD20_MODULE_STUFF,
     x402_create_dir_config,
     x402_merge_dir_config,
-    NULL,
-    NULL,
+    x402_create_server_config,
+    x402_merge_server_config,
     x402_cmds,
     x402_register_hooks,
     0};

@@ -265,22 +265,50 @@ Add analogous `priceX10` and `priceX100` blocks if needed.
 
 ## 8. Split Mode Apache Config
 
-To convert the same routes to split settlement, replace the single-recipient directives:
+Split payout control can be placed in Apache serverwide config so the server operator owns the splitter contract and operator payout. Create `/etc/apache2/conf-available/x402-splits.conf`:
 
-- remove:
-  - `X402PayTo ...`
-- add:
-  - `X402StellarLocalBackend inprocess`
-  - `X402StellarConfigDir /etc/apache2/x402-stellar`
-  - `X402StellarSourceAccount operator_demo_split`
-  - `X402StellarRpcURL https://soroban-testnet.stellar.org:443`
-  - `X402StellarNetworkPassphrase "Test SDF Network ; September 2015"`
-  - `X402SplitMode multi`
-  - `X402SplitterContract CCTVCH6BUWS4XESFHK4BHKK35KY56PQ5PGSIQHKJBNYMTWXXGXLYKMBD`
-  - `X402Stakeholder server 7000 <server_account>`
-  - `X402Stakeholder creator 3000 <creator_account>`
+```apache
+X402SplitMode multi
+X402SplitterContract CCTVCH6BUWS4XESFHK4BHKK35KY56PQ5PGSIQHKJBNYMTWXXGXLYKMBD
+X402Stakeholder server_operator 300 <operator_account>
+```
 
-Example split `/app/foo` block:
+Then enable it:
+
+```sh
+sudo a2enconf x402-splits
+```
+
+When this file is enabled, its split mode and splitter contract apply to all x402 routes. Route or vhost config must not override them. Route or vhost config may add publisher stakeholders, and the combined basis points across systemwide and local stakeholders must sum to `10000`.
+
+With the installer, use:
+
+- `X402_OPERATOR_STAKEHOLDER_1_NAME`
+- `X402_OPERATOR_STAKEHOLDER_1_BPS`
+- `X402_OPERATOR_STAKEHOLDER_1_DEST`
+- `X402_PUBLISHER_STAKEHOLDER_1_NAME`
+- `X402_PUBLISHER_STAKEHOLDER_1_BPS`
+- `X402_PUBLISHER_STAKEHOLDER_1_DEST`
+
+Add more stakeholders by incrementing the index up to `X402_MAX_STAKEHOLDERS`, default `16`.
+
+Use route-specific publisher stakeholders when one generated route needs a different payout list:
+
+- `X402_ROUTE_APP_FOO_STAKEHOLDER_1_*`
+- `X402_ROUTE_PRICE_STAKEHOLDER_1_*`
+- `X402_ROUTE_PRICEX2_STAKEHOLDER_1_*`
+- `X402_ROUTE_PRICEX10_STAKEHOLDER_1_*`
+- `X402_ROUTE_PRICEX100_STAKEHOLDER_1_*`
+
+The compatibility variables `X402_STAKEHOLDER_1_*` and `X402_STAKEHOLDER_2_*` still map to operator and publisher respectively.
+
+For split settlement, replace the single-recipient route directive:
+
+- remove `X402PayTo ...`
+- add the Stellar local settlement directives shown below
+- optionally add route or vhost `X402Stakeholder` lines for publisher shares
+
+Example split `/app/foo` block with a publisher share:
 
 ```apache
 <Location "/app/foo">
@@ -302,10 +330,7 @@ Example split `/app/foo` block:
     X402StellarNetworkPassphrase "Test SDF Network ; September 2015"
     X402TimeoutSeconds 30
     X402PaymentIdentifier required
-    X402SplitMode multi
-    X402SplitterContract CCTVCH6BUWS4XESFHK4BHKK35KY56PQ5PGSIQHKJBNYMTWXXGXLYKMBD
-    X402Stakeholder server 7000 GAQH3VXDLXCUESK4CGC77BBA5X4CFSR2HAWTVXYAC2H6AHI6BE7LHEBX
-    X402Stakeholder creator 3000 GACTCLSHLLAPVXEATOTMR6ZVKRGEJYPO6RDMZXJS76BXRBCAH5YWJ5P2
+    X402Stakeholder content_publisher 9700 GACTCLSHLLAPVXEATOTMR6ZVKRGEJYPO6RDMZXJS76BXRBCAH5YWJ5P2
     X402Prepay On
     X402PrepayMultiplierMax 100
     X402CreditScope payer-route
@@ -382,7 +407,7 @@ sudo tail -n 100 /var/log/apache2/error.log
 
 Split payment returns `200` but no split hash:
 
-- confirm the route has `X402SplitMode multi`
+- confirm `x402-splits.conf` is enabled with `a2enconf x402-splits`
 - confirm Apache was fully restarted after module deployment
 - confirm the loaded module is the current one
 

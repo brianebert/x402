@@ -85,16 +85,44 @@ Single-recipient mode uses:
 
 - `X402PayTo <recipient>`
 
-Split mode uses:
+Systemwide split mode uses:
 
+- `/etc/apache2/conf-available/x402-splits.conf`
 - `X402SplitMode multi`
 - `X402SplitterContract <contract>`
-- repeated `X402Stakeholder <name> <bps> <destination>`
+- operator-owned `X402Stakeholder <name> <bps> <destination>` entries
+
+Route blocks for split settlement still use:
+
 - `X402StellarLocalBackend inprocess`
 - `X402StellarConfigDir /etc/apache2/x402-stellar`
 - `X402StellarSourceAccount <identity_name>`
+- publisher/content `X402Stakeholder <name> <bps> <destination>` entries
 
-With `X402_ENABLE_SPLIT=1`, the installer converts the existing route family to split settlement rather than creating a separate split-only route.
+With `X402_ENABLE_SPLIT=1`, the installer converts the existing route family to split settlement by enabling `x402-splits.conf` with `a2enconf x402-splits`. It writes operator stakeholders to the systemwide config and publisher stakeholders into each route block.
+
+When a systemwide split policy is enabled, Apache applies it to all x402 routes. Route and vhost config cannot override the split mode or splitter contract. Additional route or vhost stakeholders may be added for publisher shares, and the combined stakeholder basis points must still sum to `10000`.
+
+Preferred indexed installer variables:
+
+- `X402_OPERATOR_STAKEHOLDER_1_NAME`
+- `X402_OPERATOR_STAKEHOLDER_1_BPS`
+- `X402_OPERATOR_STAKEHOLDER_1_DEST`
+- `X402_PUBLISHER_STAKEHOLDER_1_NAME`
+- `X402_PUBLISHER_STAKEHOLDER_1_BPS`
+- `X402_PUBLISHER_STAKEHOLDER_1_DEST`
+
+Add more stakeholders by incrementing the index up to `X402_MAX_STAKEHOLDERS`, default `16`.
+
+Route-specific publisher stakeholders override the default publisher list for one generated route:
+
+- `X402_ROUTE_APP_FOO_STAKEHOLDER_1_*`
+- `X402_ROUTE_PRICE_STAKEHOLDER_1_*`
+- `X402_ROUTE_PRICEX2_STAKEHOLDER_1_*`
+- `X402_ROUTE_PRICEX10_STAKEHOLDER_1_*`
+- `X402_ROUTE_PRICEX100_STAKEHOLDER_1_*`
+
+For compatibility, `X402_STAKEHOLDER_1_*` maps to the operator stakeholder and `X402_STAKEHOLDER_2_*` maps to the publisher stakeholder.
 
 Facilitator bearer keys should be file-backed:
 

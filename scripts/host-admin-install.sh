@@ -29,6 +29,101 @@ require_env() {
   fi
 }
 
+env_value() {
+  local name="$1"
+  printf '%s' "${!name:-}"
+}
+
+validate_bps() {
+  local label="$1"
+  local value="$2"
+
+  if [[ ! "$value" =~ ^[0-9]+$ || "$value" -gt 10000 ]]; then
+    echo "$label basis points must be an integer between 0 and 10000" >&2
+    exit 1
+  fi
+}
+
+add_stakeholder() {
+  local array_name="$1"
+  local label="$2"
+  local name="$3"
+  local bps="$4"
+  local dest="$5"
+
+  if [[ -z "$name" || -z "$bps" || -z "$dest" ]]; then
+    echo "$label requires NAME, BPS, and DEST" >&2
+    exit 1
+  fi
+  validate_bps "$label" "$bps"
+  eval "$array_name+=(\"\$name|\$bps|\$dest\")"
+}
+
+collect_indexed_stakeholders() {
+  local array_name="$1"
+  local prefix="$2"
+  local label="$3"
+  local i name bps dest
+
+  for ((i = 1; i <= MAX_STAKEHOLDERS; i++)); do
+    name="$(env_value "${prefix}_${i}_NAME")"
+    bps="$(env_value "${prefix}_${i}_BPS")"
+    dest="$(env_value "${prefix}_${i}_DEST")"
+    if [[ -n "$name" || -n "$bps" || -n "$dest" ]]; then
+      add_stakeholder "$array_name" "$label $i" "$name" "$bps" "$dest"
+    fi
+  done
+}
+
+route_key() {
+  local route="$1"
+
+  route="${route#/}"
+  route="${route//\//_}"
+  route="${route//-/_}"
+  route="${route^^}"
+  printf '%s\n' "$route"
+}
+
+collect_route_stakeholders() {
+  local array_name="$1"
+  local key="$2"
+  local i name bps dest
+
+  eval "$array_name=()"
+  for ((i = 1; i <= MAX_STAKEHOLDERS; i++)); do
+    name="$(env_value "X402_ROUTE_${key}_STAKEHOLDER_${i}_NAME")"
+    bps="$(env_value "X402_ROUTE_${key}_STAKEHOLDER_${i}_BPS")"
+    dest="$(env_value "X402_ROUTE_${key}_STAKEHOLDER_${i}_DEST")"
+    if [[ -n "$name" || -n "$bps" || -n "$dest" ]]; then
+      add_stakeholder "$array_name" "route $key stakeholder $i" "$name" "$bps" "$dest"
+    fi
+  done
+}
+
+stakeholder_bps_sum() {
+  local sum=0
+  local entry bps
+
+  for entry in "$@"; do
+    IFS='|' read -r _ bps _ <<< "$entry"
+    sum=$((sum + bps))
+  done
+  printf '%s\n' "$sum"
+}
+
+emit_stakeholders() {
+  local target="$1"
+  local indent="$2"
+  shift 2
+  local entry name bps dest
+
+  for entry in "$@"; do
+    IFS='|' read -r name bps dest <<< "$entry"
+    printf '%sX402Stakeholder %s %s %s\n' "$indent" "$name" "$bps" "$dest" >> "$target"
+  done
+}
+
 detect_host_ipv4() {
   local route_ip
   route_ip="$(ip -o route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}')"
@@ -77,6 +172,16 @@ STAKEHOLDER_1_DEST="${X402_STAKEHOLDER_1_DEST:-}"
 STAKEHOLDER_2_NAME="${X402_STAKEHOLDER_2_NAME:-affiliate}"
 STAKEHOLDER_2_BPS="${X402_STAKEHOLDER_2_BPS:-3000}"
 STAKEHOLDER_2_DEST="${X402_STAKEHOLDER_2_DEST:-}"
+OPERATOR_STAKEHOLDER_NAME="${X402_OPERATOR_STAKEHOLDER_NAME:-$STAKEHOLDER_1_NAME}"
+OPERATOR_STAKEHOLDER_BPS="${X402_OPERATOR_STAKEHOLDER_BPS:-$STAKEHOLDER_1_BPS}"
+OPERATOR_STAKEHOLDER_DEST="${X402_OPERATOR_STAKEHOLDER_DEST:-$STAKEHOLDER_1_DEST}"
+PUBLISHER_STAKEHOLDER_NAME="${X402_PUBLISHER_STAKEHOLDER_NAME:-$STAKEHOLDER_2_NAME}"
+PUBLISHER_STAKEHOLDER_BPS="${X402_PUBLISHER_STAKEHOLDER_BPS:-$STAKEHOLDER_2_BPS}"
+PUBLISHER_STAKEHOLDER_DEST="${X402_PUBLISHER_STAKEHOLDER_DEST:-$STAKEHOLDER_2_DEST}"
+MAX_STAKEHOLDERS="${X402_MAX_STAKEHOLDERS:-16}"
+
+OPERATOR_STAKEHOLDERS=()
+PUBLISHER_STAKEHOLDERS=()
 
 ENABLE_SSL="${X402_ENABLE_SSL:-0}"
 SSL_CERT_FILE="${X402_SSL_CERT_FILE:-}"
@@ -89,9 +194,68 @@ CREDIT_DB_DIR="/var/lib/x402"
 CREDIT_DB_PATH="$CREDIT_DB_DIR/credits.db"
 SITE_CONF="/etc/apache2/sites-available/${SITE_NAME}.conf"
 SITE_SSL_CONF="/etc/apache2/sites-available/${SITE_NAME}-ssl.conf"
+SPLIT_CONF="/etc/apache2/conf-available/x402-splits.conf"
 MODULE_LOAD_CONF="/etc/apache2/mods-available/x402.load"
 MODULE_PATH="/usr/lib/apache2/modules/mod_x402.so"
 STELLAR_IDENTITY_PATH=""
+
+publisher_stakeholders_for_route() {
+  local array_name="$1"
+  local route="$2"
+  local key
+
+  key="$(route_key "$route")"
+  collect_route_stakeholders "$array_name" "$key"
+  eval "if [[ \${#$array_name[@]} -eq 0 ]]; then $array_name=(\"\${PUBLISHER_STAKEHOLDERS[@]}\"); fi"
+}
+
+collect_split_stakeholders() {
+  collect_indexed_stakeholders OPERATOR_STAKEHOLDERS X402_OPERATOR_STAKEHOLDER "operator stakeholder"
+  collect_indexed_stakeholders PUBLISHER_STAKEHOLDERS X402_PUBLISHER_STAKEHOLDER "publisher stakeholder"
+
+  if [[ "${#OPERATOR_STAKEHOLDERS[@]}" -eq 0 && -n "$OPERATOR_STAKEHOLDER_DEST" ]]; then
+    add_stakeholder OPERATOR_STAKEHOLDERS "operator stakeholder" \
+      "$OPERATOR_STAKEHOLDER_NAME" "$OPERATOR_STAKEHOLDER_BPS" "$OPERATOR_STAKEHOLDER_DEST"
+  fi
+  if [[ "${#PUBLISHER_STAKEHOLDERS[@]}" -eq 0 && -n "$PUBLISHER_STAKEHOLDER_DEST" ]]; then
+    add_stakeholder PUBLISHER_STAKEHOLDERS "publisher stakeholder" \
+      "$PUBLISHER_STAKEHOLDER_NAME" "$PUBLISHER_STAKEHOLDER_BPS" "$PUBLISHER_STAKEHOLDER_DEST"
+  fi
+}
+
+validate_route_split_bps() {
+  local route="$1"
+  local -a route_stakeholders=()
+  local total
+
+  publisher_stakeholders_for_route route_stakeholders "$route"
+  if [[ "${#route_stakeholders[@]}" -eq 0 ]]; then
+    echo "Split mode requires at least one publisher or route-specific stakeholder for $route" >&2
+    exit 1
+  fi
+  if [[ $((${#OPERATOR_STAKEHOLDERS[@]} + ${#route_stakeholders[@]})) -gt "$MAX_STAKEHOLDERS" ]]; then
+    echo "Too many combined stakeholders for $route" >&2
+    exit 1
+  fi
+  total="$(stakeholder_bps_sum "${OPERATOR_STAKEHOLDERS[@]}" "${route_stakeholders[@]}")"
+  if [[ "$total" -ne 10000 ]]; then
+    echo "Combined stakeholder bps for $route must sum to 10000; got $total" >&2
+    exit 1
+  fi
+}
+
+validate_split_stakeholders() {
+  local route
+
+  collect_split_stakeholders
+  if [[ "${#OPERATOR_STAKEHOLDERS[@]}" -eq 0 ]]; then
+    echo "Split mode requires at least one operator stakeholder" >&2
+    exit 1
+  fi
+  for route in "/app/foo" "/price" "/priceX2" "/priceX10" "/priceX100"; do
+    validate_route_split_bps "$route"
+  done
+}
 
 require_env X402_ASSET
 if [[ "$ENABLE_SPLIT" != "1" ]]; then
@@ -130,8 +294,7 @@ fi
 if [[ "$ENABLE_SPLIT" == "1" ]]; then
   require_env X402_STELLAR_SOURCE_ACCOUNT
   require_env X402_SPLITTER_CONTRACT
-  require_env X402_STAKEHOLDER_1_DEST
-  require_env X402_STAKEHOLDER_2_DEST
+  validate_split_stakeholders
   STELLAR_IDENTITY_PATH="$STELLAR_CONFIG_DIR/identity/${STELLAR_SOURCE_ACCOUNT}.toml"
 fi
 
@@ -227,6 +390,16 @@ sudo chmod 600 "$FACILITATOR_KEY_PATH"
 
 TMP_HTTP="$(mktemp)"
 TMP_SSL=""
+TMP_SPLIT=""
+
+if [[ "$ENABLE_SPLIT" == "1" ]]; then
+  TMP_SPLIT="$(mktemp)"
+  cat > "$TMP_SPLIT" <<EOF
+X402SplitMode multi
+X402SplitterContract $SPLITTER_CONTRACT
+EOF
+  emit_stakeholders "$TMP_SPLIT" "" "${OPERATOR_STAKEHOLDERS[@]}"
+fi
 
 write_route_block() {
   local target="$1"
@@ -235,6 +408,7 @@ write_route_block() {
   local route_desc="$4"
   local credits_issued="${5:-}"
   local forward_to="${6:-}"
+  local -a route_stakeholders=()
   cat >> "$target" <<EOF
     <Location "$route">
         X402 On
@@ -263,12 +437,8 @@ EOF
         X402PaymentIdentifier required
 EOF
   if [[ "$ENABLE_SPLIT" == "1" ]]; then
-    cat >> "$target" <<EOF
-        X402SplitMode multi
-        X402SplitterContract $SPLITTER_CONTRACT
-        X402Stakeholder $STAKEHOLDER_1_NAME $STAKEHOLDER_1_BPS $STAKEHOLDER_1_DEST
-        X402Stakeholder $STAKEHOLDER_2_NAME $STAKEHOLDER_2_BPS $STAKEHOLDER_2_DEST
-EOF
+    publisher_stakeholders_for_route route_stakeholders "$route"
+    emit_stakeholders "$target" "        " "${route_stakeholders[@]}"
   else
     cat >> "$target" <<EOF
         X402SplitMode single
@@ -370,6 +540,10 @@ EOF
 fi
 
 echo "Installing Apache site config..."
+if [[ -n "$TMP_SPLIT" ]]; then
+  sudo install -m 644 "$TMP_SPLIT" "$SPLIT_CONF"
+  rm -f "$TMP_SPLIT"
+fi
 sudo install -m 644 "$TMP_HTTP" "$SITE_CONF"
 rm -f "$TMP_HTTP"
 
@@ -381,6 +555,11 @@ fi
 echo "Enabling Apache modules and sites..."
 sudo a2enmod headers rewrite >/dev/null
 sudo a2enmod x402 >/dev/null
+if [[ "$ENABLE_SPLIT" == "1" ]]; then
+  sudo a2enconf x402-splits >/dev/null
+else
+  sudo a2disconf x402-splits >/dev/null 2>&1 || true
+fi
 sudo a2dissite 000-default.conf >/dev/null 2>&1 || true
 if [[ "$ENABLE_SSL" == "1" ]]; then
   sudo a2enmod ssl >/dev/null
@@ -408,6 +587,9 @@ fi
 echo "Module: $MODULE_PATH"
 echo "Facilitator key: $FACILITATOR_KEY_PATH"
 echo "Credit DB: $CREDIT_DB_PATH"
+if [[ "$ENABLE_SPLIT" == "1" ]]; then
+  echo "Split config: $SPLIT_CONF"
+fi
 echo "Env file: $ENV_FILE"
 if [[ -n "$DOMAIN" ]]; then
   echo "HTTP host: http://$DOMAIN/"
