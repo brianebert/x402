@@ -353,6 +353,7 @@ x402_status x402_build_payment_response_json(const x402_route_policy *policy,
   }
 
   if(result->settled) {
+    int extension_written = 0;
     x402_status status = x402_appendf(
         buffer, buffer_size, &offset,
         "{\"success\":true,\"scheme\":\"%s\",\"network\":\"%s\","
@@ -377,6 +378,19 @@ x402_status x402_build_payment_response_json(const x402_route_policy *policy,
       if(status != X402_STATUS_OK) {
         return status;
       }
+      extension_written = 1;
+    }
+
+    if(result->split_transaction_hash[0] != '\0') {
+      status = x402_appendf(
+          buffer, buffer_size, &offset,
+          "%s\"stellar-split\":{\"transactionHash\":\"%s\"}",
+          extension_written ? "," : "",
+          result->split_transaction_hash);
+      if(status != X402_STATUS_OK) {
+        return status;
+      }
+      extension_written = 1;
     }
 
     if(policy->split_mode == X402_SPLIT_MULTI) {
@@ -384,12 +398,13 @@ x402_status x402_build_payment_response_json(const x402_route_policy *policy,
           buffer, buffer_size, &offset,
           "%s\"stakeholder-split\":{\"mode\":\"multi\",\"contract\":\"%s\","
           "\"execution\":\"%s\"}",
-          policy->credits.enabled ? "," : "",
+          extension_written ? "," : "",
           policy->splitter_contract,
           x402_split_execution_name(policy));
       if(status != X402_STATUS_OK) {
         return status;
       }
+      extension_written = 1;
     }
 
     if(result->session_token[0] != '\0') {
@@ -397,7 +412,7 @@ x402_status x402_build_payment_response_json(const x402_route_policy *policy,
           buffer, buffer_size, &offset,
           "%s\"stellar-session-auth\":{\"token\":\"%s\",\"header\":\"X402-Session\","
           "\"scheme\":\"stellar-prepaid-session-v1\",\"expiresAt\":%" PRIu64 "}",
-          (policy->credits.enabled || policy->split_mode == X402_SPLIT_MULTI) ? "," : "",
+          extension_written ? "," : "",
           result->session_token,
           result->session_expires_at);
       if(status != X402_STATUS_OK) {

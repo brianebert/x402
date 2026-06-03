@@ -1982,6 +1982,15 @@ static x402_status stellar_settle(const x402_route_policy *policy,
                 x402_settlement_mode_name(policy->settlement_mode));
 
   if(policy->split_mode == X402_SPLIT_MULTI) {
+    if(local_splitter_ready(policy)) {
+      x402_status split_prepare_status =
+          prepare_splitter_settle_balance(policy, request, &prepared_split, result);
+      if(split_prepare_status != X402_STATUS_OK) {
+        result->settled = 0;
+        return split_prepare_status;
+      }
+      dispatch_async_splitter_settle_balance(policy, request, result, prepared_split);
+    }
     std::snprintf(result->message,
                   sizeof(result->message),
                   "settle via splitter contract %s",

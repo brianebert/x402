@@ -73,6 +73,72 @@ sudo X402_ENV_FILE=/srv/x402/.env ./scripts/host-vhost-install.sh
 
 Use `host-system-install.sh` when changing packages, rebuilding the module, changing facilitator state, or changing systemwide split policy in `/etc/apache2/conf-available/x402-splits.conf`. Use `host-vhost-install.sh` when changing generated vhost, route, document-root, TLS, or publisher stakeholder config.
 
+`host-vhost-install.sh` can manage multiple operator-defined Apache vhosts. For
+each vhost, copy the vhost template and fill in its values:
+
+```bash
+cp /srv/x402/.vhost.env.example /srv/x402/.nobody.news.env
+sudo /srv/x402/scripts/host-vhost-install.sh nobody.news
+```
+
+When a vhost name is passed as the first argument, the installer reads
+`/srv/x402/.env` first, then overlays `/srv/x402/.<vhost_name>.env`. Keep
+shared settings such as facilitator, asset, and split policy in `.env`; keep
+hostnames, TLS, proxy, snippets, and route overrides in the per-vhost file. The
+env file should set `X402_SITE_NAME` to the same value unless it is intentionally
+recreating an older generated site name. `X402_SITE_NAME` controls the Apache
+config filenames:
+
+- `/etc/apache2/sites-available/${X402_SITE_NAME}.conf`
+- `/etc/apache2/sites-available/${X402_SITE_NAME}-ssl.conf`
+
+Lifecycle actions:
+
+```bash
+X402_VHOST_ACTION=install  # default
+X402_VHOST_ACTION=disable  # a2dissite, keep config files
+X402_VHOST_ACTION=delete   # a2dissite and remove generated config files
+```
+
+Vhost modes:
+
+```bash
+X402_VHOST_MODE=static # default generated document-root + static X402 routes
+X402_VHOST_MODE=proxy  # reverse-proxy vhost, optionally with dynamic intents
+```
+
+Reverse-proxy vhost example:
+
+```bash
+X402_SITE_NAME=nobody
+X402_VHOST_MODE=proxy
+X402_SERVER_NAME=nobody.cryptify.shop
+X402_ENABLE_SSL=1
+X402_SSL_CERT_FILE=/etc/apache2/ssl/cryptify.shop/fullchain.pem
+X402_SSL_KEY_FILE=/etc/apache2/ssl/cryptify.shop/privkey.pem
+X402_PROXY_TARGET=http://10.120.0.4:8008/
+X402_PROXY_EXCLUDE_PATHS="/staging /staging/"
+X402_PROXY_ERROR_DOCUMENT=/errors/as-404.php
+X402_ENABLE_DYNAMIC_INTENTS=1
+X402_INTENT_SECRET_SOURCE_FILE=/root/nobody-intent.key
+sudo /srv/x402/scripts/host-vhost-install.sh nobody.news
+```
+
+For automation that already manages env paths, `X402_ENV_FILE=/path/to/file`
+still overrides the vhost-name convention.
+
+Operator-specific Apache directives can be included with snippet files:
+
+```bash
+X402_VHOST_HTTP_SNIPPET_FILE=/srv/x402/vhosts/nobody-http.inc
+X402_VHOST_SSL_SNIPPET_FILE=/srv/x402/vhosts/nobody-ssl.inc
+```
+
+Snippet files are inserted inside the generated `<VirtualHost>` block after
+`ServerName`/`ServerAlias` and before generated redirect or proxy directives.
+Use them for per-vhost logging, `RedirectMatch`, temporary `LogLevel`, and
+similar Apache directives. Do not include `<VirtualHost>` wrappers in snippets.
+
 If you need a hard module refresh after changing C/C++ code, prefer a full Apache restart:
 
 ```sh
@@ -170,6 +236,17 @@ X402DynamicCheckoutEndpoint /api/store/checkout
 X402IntentSecretFile /etc/apache2/x402-secrets/intent.key
 ```
 
+For generated vhost configs, enable those directives with:
+
+```bash
+X402_ENABLE_DYNAMIC_INTENTS=1
+X402_CHALLENGE_ENDPOINT=/x402/challenge
+X402_DYNAMIC_CHECKOUT_ENDPOINT=/api/store/checkout
+X402_INTENT_SECRET='shared-store-secret'
+# or: X402_INTENT_SECRET_SOURCE_FILE=/path/to/intent.key
+# or: X402_INTENT_SECRET_PATH=/etc/apache2/x402-secrets/site-intent.key
+```
+
 The store app calls the endpoint with `POST`, header
 `X-X402-Intent-Secret: <secret>`, and JSON:
 
@@ -199,14 +276,41 @@ body:
 ```
 
 If a systemwide split policy is enabled, the same global operator split policy
-is applied to dynamic challenges. Client-supplied trusted payment headers are
-stripped before the endpoint handles the request.
+is applied to dynamic challenges. The store can supply the publisher/store side
+of the split per checkout:
+
+```json
+{
+  "payment_identifier": "ord_123",
+  "resource": "/api/store/checkout",
+  "network": "stellar:testnet",
+  "asset": "USDC:<issuer>",
+  "amount_usdc": "0.42",
+  "stakeholders": [
+    {
+      "name": "store",
+      "bps": 3000,
+      "destination": "G..."
+    }
+  ]
+}
+```
+
+Apache merges those dynamic stakeholders with the serverwide stakeholders from
+`x402-splits.conf`, validates that basis points sum to `10000`, stores the
+resolved policy with the intent, and uses the server-controlled splitter
+contract at checkout settlement time. Client-supplied trusted payment headers
+are stripped before the endpoint handles the request.
 
 Dynamic checkout is XOR with static paid retries. Do not configure the dynamic
 checkout path with `X402 On`. The buyer submits `PAYMENT-SIGNATURE` to
 `X402DynamicCheckoutEndpoint`; Apache decodes `paymentIdentifier`, loads the
 stored intent, verifies and settles it once, injects trusted `X-X402-*` headers,
 and then lets the proxied store app handle the request.
+
+Dynamic intent storage is scoped by Apache vhost `ServerName` plus
+`payment_identifier`, so separate generated vhosts can reuse the same order IDs
+without colliding in the shared SQLite credit DB.
 
 ## Trusted Upstream Headers
 

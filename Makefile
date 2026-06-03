@@ -19,6 +19,9 @@ all: $(CORE_OBJS) $(PROVIDER_OBJS)
 
 check-build: $(CORE_OBJS) $(PROVIDER_OBJS)
 
+test:
+	bash tests/dynamic-intent-vhost-scope.sh
+
 core/x402_core.o: core/x402_core.c core/x402_provider.h
 	$(CC) $(CFLAGS) $(REPO_INCLUDES) -c -o $@ core/x402_core.c
 

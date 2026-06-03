@@ -18,12 +18,35 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 ENV_FILE="${X402_ENV_FILE:-$ROOT/.env}"
+VHOST_ENV_FILE="${X402_VHOST_ENV_FILE:-}"
+declare -A X402_CALLER_ENV=()
+for name in $(compgen -v X402_); do
+  case "$name" in
+    X402_CALLER_ENV|X402_HOST_INSTALL_COMMON_LOADED) continue ;;
+  esac
+  X402_CALLER_ENV["$name"]="${!name}"
+done
 
-if [[ -f "$ENV_FILE" ]]; then
-  set -a
-  # shellcheck disable=SC1090
-  source "$ENV_FILE"
-  set +a
+source_env_file() {
+  local file="$1"
+
+  if [[ -f "$file" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "$file"
+    set +a
+  fi
+}
+
+source_env_file "$ENV_FILE"
+if [[ -n "$VHOST_ENV_FILE" ]]; then
+  source_env_file "$VHOST_ENV_FILE"
+fi
+if [[ "${#X402_CALLER_ENV[@]}" -gt 0 ]]; then
+  for name in "${!X402_CALLER_ENV[@]}"; do
+    printf -v "$name" '%s' "${X402_CALLER_ENV[$name]}"
+    export "$name"
+  done
 fi
 
 require_env() {
@@ -306,9 +329,15 @@ route_docroot_path() {
 init_x402_defaults() {
   PROJECT_DIR="${X402_PROJECT_DIR:-$ROOT}"
   SITE_NAME="${X402_SITE_NAME:-x402}"
+  VHOST_ACTION="${X402_VHOST_ACTION:-install}"
+  VHOST_MODE="${X402_VHOST_MODE:-static}"
   DOMAIN="${X402_DOMAIN:-}"
   SERVER_NAME="${X402_SERVER_NAME:-}"
+  SERVER_ALIASES="${X402_SERVER_ALIASES:-}"
+  ENABLE_WWW_ALIAS="${X402_ENABLE_WWW_ALIAS:-1}"
   DOCROOT="${X402_DOCROOT:-/var/www/$SITE_NAME}"
+  VHOST_HTTP_SNIPPET_FILE="${X402_VHOST_HTTP_SNIPPET_FILE:-}"
+  VHOST_SSL_SNIPPET_FILE="${X402_VHOST_SSL_SNIPPET_FILE:-}"
 
   FACILITATOR_URL="${X402_FACILITATOR_URL:-https://channels.openzeppelin.com/x402/testnet}"
   NETWORK="${X402_NETWORK:-stellar:testnet}"
@@ -346,6 +375,19 @@ init_x402_defaults() {
   ENABLE_SSL="${X402_ENABLE_SSL:-0}"
   SSL_CERT_FILE="${X402_SSL_CERT_FILE:-}"
   SSL_KEY_FILE="${X402_SSL_KEY_FILE:-}"
+
+  ENABLE_DYNAMIC_INTENTS="${X402_ENABLE_DYNAMIC_INTENTS:-0}"
+  CHALLENGE_ENDPOINT="${X402_CHALLENGE_ENDPOINT:-/x402/challenge}"
+  DYNAMIC_CHECKOUT_ENDPOINT="${X402_DYNAMIC_CHECKOUT_ENDPOINT:-/api/store/checkout}"
+  INTENT_SECRET="${X402_INTENT_SECRET:-}"
+  INTENT_SECRET_SOURCE_FILE="${X402_INTENT_SECRET_SOURCE_FILE:-}"
+  INTENT_SECRET_PATH="${X402_INTENT_SECRET_PATH:-/etc/apache2/x402-secrets/${SITE_NAME}-intent.key}"
+
+  PROXY_TARGET="${X402_PROXY_TARGET:-}"
+  PROXY_PRESERVE_HOST="${X402_PROXY_PRESERVE_HOST:-1}"
+  PROXY_HTTPS_ONLY="${X402_PROXY_HTTPS_ONLY:-1}"
+  PROXY_EXCLUDE_PATHS="${X402_PROXY_EXCLUDE_PATHS:-}"
+  PROXY_ERROR_DOCUMENT="${X402_PROXY_ERROR_DOCUMENT:-}"
 
   FACILITATOR_API_KEY_SOURCE_FILE="${X402_FACILITATOR_API_KEY_SOURCE_FILE:-}"
   FACILITATOR_KEY_PATH="/etc/apache2/x402-secrets/facilitator.key"
@@ -468,10 +510,43 @@ ensure_facilitator_api_key() {
   fi
 }
 
+ensure_dynamic_intent_secret() {
+  if [[ "$ENABLE_DYNAMIC_INTENTS" != "1" ]]; then
+    return 0
+  fi
+  if [[ -n "$INTENT_SECRET" || -n "$INTENT_SECRET_SOURCE_FILE" || -f "$INTENT_SECRET_PATH" ]]; then
+    return 0
+  fi
+
+  echo "Set X402_INTENT_SECRET, X402_INTENT_SECRET_SOURCE_FILE, or X402_INTENT_SECRET_PATH for dynamic intents." >&2
+  exit 1
+}
+
 validate_common_config() {
-  require_env X402_ASSET
-  if [[ "$ENABLE_SPLIT" != "1" ]]; then
-    require_env X402_PAY_TO
+  case "$VHOST_ACTION" in
+    install|disable|delete) ;;
+    *)
+      echo "X402_VHOST_ACTION must be install, disable, or delete." >&2
+      exit 1
+      ;;
+  esac
+  case "$VHOST_MODE" in
+    static|proxy) ;;
+    *)
+      echo "X402_VHOST_MODE must be static or proxy." >&2
+      exit 1
+      ;;
+  esac
+
+  if [[ "$VHOST_ACTION" != "install" ]]; then
+    return 0
+  fi
+
+  if [[ "$VHOST_MODE" == "static" ]]; then
+    require_env X402_ASSET
+    if [[ "$ENABLE_SPLIT" != "1" ]]; then
+      require_env X402_PAY_TO
+    fi
   fi
 
   if [[ "$ENABLE_SPLIT" == "1" ]]; then
@@ -480,6 +555,27 @@ validate_common_config() {
     STELLAR_IDENTITY_PATH="$STELLAR_CONFIG_DIR/identity/${STELLAR_SOURCE_ACCOUNT}.toml"
   fi
 
+  if [[ "$VHOST_MODE" == "proxy" ]]; then
+    require_env X402_PROXY_TARGET
+    if [[ "$PROXY_TARGET" != http://* && "$PROXY_TARGET" != https://* ]]; then
+      echo "X402_PROXY_TARGET must start with http:// or https://." >&2
+      exit 1
+    fi
+    case "$PROXY_PRESERVE_HOST" in
+      0|1) ;;
+      *) echo "X402_PROXY_PRESERVE_HOST must be 0 or 1." >&2; exit 1 ;;
+    esac
+    case "$PROXY_HTTPS_ONLY" in
+      0|1) ;;
+      *) echo "X402_PROXY_HTTPS_ONLY must be 0 or 1." >&2; exit 1 ;;
+    esac
+  fi
+
+  case "$ENABLE_WWW_ALIAS" in
+    0|1) ;;
+    *) echo "X402_ENABLE_WWW_ALIAS must be 0 or 1." >&2; exit 1 ;;
+  esac
+
   if [[ "$ENABLE_SSL" == "1" ]]; then
     if [[ -z "$DOMAIN" ]]; then
       echo "Set X402_DOMAIN when X402_ENABLE_SSL=1." >&2
@@ -487,6 +583,30 @@ validate_common_config() {
     fi
     require_env X402_SSL_CERT_FILE
     require_env X402_SSL_KEY_FILE
+  fi
+
+  if [[ -n "$VHOST_HTTP_SNIPPET_FILE" && ! -f "$VHOST_HTTP_SNIPPET_FILE" ]]; then
+    echo "X402_VHOST_HTTP_SNIPPET_FILE does not exist: $VHOST_HTTP_SNIPPET_FILE" >&2
+    exit 1
+  fi
+  if [[ -n "$VHOST_SSL_SNIPPET_FILE" && ! -f "$VHOST_SSL_SNIPPET_FILE" ]]; then
+    echo "X402_VHOST_SSL_SNIPPET_FILE does not exist: $VHOST_SSL_SNIPPET_FILE" >&2
+    exit 1
+  fi
+
+  if [[ "$ENABLE_DYNAMIC_INTENTS" == "1" ]]; then
+    if [[ "$CHALLENGE_ENDPOINT" != /* ]]; then
+      echo "X402_CHALLENGE_ENDPOINT must be an absolute URI path." >&2
+      exit 1
+    fi
+    if [[ "$DYNAMIC_CHECKOUT_ENDPOINT" != /* ]]; then
+      echo "X402_DYNAMIC_CHECKOUT_ENDPOINT must be an absolute URI path." >&2
+      exit 1
+    fi
+    ensure_dynamic_intent_secret
+  elif [[ "$ENABLE_DYNAMIC_INTENTS" != "0" ]]; then
+    echo "X402_ENABLE_DYNAMIC_INTENTS must be 0 or 1." >&2
+    exit 1
   fi
 }
 
@@ -502,9 +622,24 @@ validate_system_config() {
 }
 
 validate_vhost_config() {
+  local count i route
+
   validate_common_config
-  if [[ "$ENABLE_SPLIT" == "1" ]]; then
+  if [[ "$VHOST_ACTION" != "install" ]]; then
+    return 0
+  fi
+  if [[ "$ENABLE_SPLIT" == "1" && "$VHOST_MODE" == "static" ]]; then
     validate_split_stakeholders_for_routes
+  fi
+  if [[ "$ENABLE_DYNAMIC_INTENTS" == "1" && "$VHOST_MODE" == "static" ]]; then
+    count="$(route_count)"
+    for ((i = 1; i <= count; i++)); do
+      route="$(route_path "$i")"
+      if [[ "$route" == "$DYNAMIC_CHECKOUT_ENDPOINT" ]]; then
+        echo "X402_DYNAMIC_CHECKOUT_ENDPOINT must not also be configured as a static X402 route: $route" >&2
+        exit 1
+      fi
+    done
   fi
 }
 

@@ -49,7 +49,7 @@ sudo install -m 644 apache/.libs/mod_x402.so "$MODULE_PATH"
 printf 'LoadModule x402_module %s\n' "$MODULE_PATH" | sudo tee "$MODULE_LOAD_CONF" >/dev/null
 
 echo "Creating x402 local state..."
-sudo install -d -m 700 /etc/apache2/x402-secrets
+sudo install -d -o root -g www-data -m 750 /etc/apache2/x402-secrets
 sudo install -d -m 750 "$STELLAR_CONFIG_DIR"
 sudo chown root:www-data "$STELLAR_CONFIG_DIR"
 sudo install -d -m 750 "$STELLAR_CONFIG_DIR/identity"
@@ -76,6 +76,21 @@ else
   sudo install -m 600 "$FACILITATOR_API_KEY_SOURCE_FILE" "$FACILITATOR_KEY_PATH"
 fi
 sudo chmod 600 "$FACILITATOR_KEY_PATH"
+
+if [[ "$ENABLE_DYNAMIC_INTENTS" == "1" ]]; then
+  sudo chown root:www-data /etc/apache2/x402-secrets
+  sudo chmod 750 /etc/apache2/x402-secrets
+  if [[ -n "$INTENT_SECRET" ]]; then
+    printf '%s\n' "$INTENT_SECRET" | sudo tee "$INTENT_SECRET_PATH" >/dev/null
+  elif [[ -n "$INTENT_SECRET_SOURCE_FILE" ]]; then
+    sudo install -m 600 "$INTENT_SECRET_SOURCE_FILE" "$INTENT_SECRET_PATH"
+  elif [[ ! -f "$INTENT_SECRET_PATH" ]]; then
+    echo "Missing dynamic intent secret at $INTENT_SECRET_PATH" >&2
+    exit 1
+  fi
+  sudo chown root:www-data "$INTENT_SECRET_PATH"
+  sudo chmod 640 "$INTENT_SECRET_PATH"
+fi
 
 if [[ "$ENABLE_SPLIT" == "1" ]]; then
   tmp_split="$(mktemp)"
@@ -105,6 +120,9 @@ echo "System install complete."
 echo "Module: $MODULE_PATH"
 echo "Facilitator key: $FACILITATOR_KEY_PATH"
 echo "Credit DB: $CREDIT_DB_PATH"
+if [[ "$ENABLE_DYNAMIC_INTENTS" == "1" ]]; then
+  echo "Dynamic intent secret: $INTENT_SECRET_PATH"
+fi
 if [[ "$ENABLE_SPLIT" == "1" ]]; then
   echo "Split config: $SPLIT_CONF"
 fi

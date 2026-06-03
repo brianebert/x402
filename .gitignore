@@ -12,3 +12,4 @@ apache/.libs/
 *.apache.o
 core/*.o
 providers/stellar/*.o
+codex
