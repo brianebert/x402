@@ -56,10 +56,14 @@ typedef struct x402_dir_config {
 } x402_dir_config;
 
 typedef struct x402_server_config {
+  int settlement_mode_set;
+  x402_settlement_mode settlement_mode;
   int split_mode_set;
   x402_split_mode split_mode;
   int splitter_contract_set;
   char splitter_contract[X402_MAX_DESTINATION];
+  char facilitator_url[X402_MAX_TEXT];
+  char facilitator_api_key[X402_MAX_TEXT];
   char stellar_config_dir[X402_MAX_PATH];
   char stellar_source_account[X402_MAX_IDENTIFIER];
   char stellar_rpc_url[X402_MAX_TEXT];
@@ -395,6 +399,7 @@ static void *x402_create_server_config(apr_pool_t *pool, server_rec *server)
   x402_server_config *cfg = (x402_server_config *)apr_pcalloc(pool, sizeof(*cfg));
 
   (void)server;
+  cfg->settlement_mode = X402_SETTLEMENT_HYBRID;
   cfg->split_mode = X402_SPLIT_SINGLE;
   cfg->stellar_local_backend = X402_STELLAR_BACKEND_AUTO;
   snprintf(cfg->challenge_endpoint,
@@ -412,6 +417,10 @@ static void *x402_merge_server_config(apr_pool_t *pool, void *basev, void *addv)
   size_t i;
 
   *merged = *base;
+  if(add->settlement_mode_set) {
+    merged->settlement_mode_set = add->settlement_mode_set;
+    merged->settlement_mode = add->settlement_mode;
+  }
   if(add->split_mode_set) {
     merged->split_mode_set = add->split_mode_set;
     merged->split_mode = add->split_mode;
@@ -422,6 +431,18 @@ static void *x402_merge_server_config(apr_pool_t *pool, void *basev, void *addv)
              sizeof(merged->splitter_contract),
              "%s",
              add->splitter_contract);
+  }
+  if(add->facilitator_url[0] != '\0') {
+    snprintf(merged->facilitator_url,
+             sizeof(merged->facilitator_url),
+             "%s",
+             add->facilitator_url);
+  }
+  if(add->facilitator_api_key[0] != '\0') {
+    snprintf(merged->facilitator_api_key,
+             sizeof(merged->facilitator_api_key),
+             "%s",
+             add->facilitator_api_key);
   }
   if(add->stellar_config_dir[0] != '\0') {
     snprintf(merged->stellar_config_dir,
@@ -558,33 +579,56 @@ static const char *x402_cmd_mechanism(cmd_parms *cmd, void *cfgv, const char *ar
 static const char *x402_cmd_settlement_mode(cmd_parms *cmd, void *cfgv, const char *arg)
 {
   x402_dir_config *cfg = (x402_dir_config *)cfgv;
-  (void)cmd;
+  x402_server_config *server_cfg = NULL;
+  x402_settlement_mode mode;
   if(strcmp(arg, "local") == 0) {
-    cfg->policy.settlement_mode = X402_SETTLEMENT_LOCAL;
+    mode = X402_SETTLEMENT_LOCAL;
   }
   else if(strcmp(arg, "facilitator") == 0) {
-    cfg->policy.settlement_mode = X402_SETTLEMENT_FACILITATOR;
+    mode = X402_SETTLEMENT_FACILITATOR;
   }
   else if(strcmp(arg, "hybrid") == 0) {
-    cfg->policy.settlement_mode = X402_SETTLEMENT_HYBRID;
+    mode = X402_SETTLEMENT_HYBRID;
   }
   else {
     return "X402SettlementMode must be local, facilitator, or hybrid";
   }
+  if(cmd->path == NULL) {
+    server_cfg = (x402_server_config *)ap_get_module_config(cmd->server->module_config,
+                                                            &x402_module);
+    server_cfg->settlement_mode_set = 1;
+    server_cfg->settlement_mode = mode;
+    return NULL;
+  }
+  cfg->policy.settlement_mode = mode;
   return NULL;
 }
 
 static const char *x402_cmd_facilitator_url(cmd_parms *cmd, void *cfgv, const char *arg)
 {
   x402_dir_config *cfg = (x402_dir_config *)cfgv;
-  (void)cmd;
+  x402_server_config *server_cfg;
+  if(cmd->path == NULL) {
+    server_cfg = (x402_server_config *)ap_get_module_config(cmd->server->module_config,
+                                                            &x402_module);
+    return x402_set_string(server_cfg->facilitator_url,
+                           sizeof(server_cfg->facilitator_url),
+                           arg);
+  }
   return x402_set_string(cfg->policy.facilitator_url, sizeof(cfg->policy.facilitator_url), arg);
 }
 
 static const char *x402_cmd_facilitator_api_key(cmd_parms *cmd, void *cfgv, const char *arg)
 {
   x402_dir_config *cfg = (x402_dir_config *)cfgv;
-  (void)cmd;
+  x402_server_config *server_cfg;
+  if(cmd->path == NULL) {
+    server_cfg = (x402_server_config *)ap_get_module_config(cmd->server->module_config,
+                                                            &x402_module);
+    return x402_set_string(server_cfg->facilitator_api_key,
+                           sizeof(server_cfg->facilitator_api_key),
+                           arg);
+  }
   return x402_set_string(cfg->policy.facilitator_api_key,
                          sizeof(cfg->policy.facilitator_api_key),
                          arg);
@@ -647,6 +691,13 @@ static const char *x402_cmd_facilitator_api_key_file(cmd_parms *cmd, void *cfgv,
   trim_error = x402_trim_secret(buffer);
   if(trim_error != NULL) {
     return trim_error;
+  }
+  if(cmd->path == NULL) {
+    x402_server_config *server_cfg =
+        (x402_server_config *)ap_get_module_config(cmd->server->module_config, &x402_module);
+    return x402_set_string(server_cfg->facilitator_api_key,
+                           sizeof(server_cfg->facilitator_api_key),
+                           buffer);
   }
   return x402_set_string(cfg->policy.facilitator_api_key,
                          sizeof(cfg->policy.facilitator_api_key),
@@ -3091,6 +3142,24 @@ static void x402_apply_dynamic_server_defaults(request_rec *r, x402_route_policy
   if(server_cfg == NULL) {
     return;
   }
+  if(server_cfg->settlement_mode_set) {
+    policy->settlement_mode = server_cfg->settlement_mode;
+  }
+  if(server_cfg->facilitator_url[0] != '\0') {
+    snprintf(policy->facilitator_url,
+             sizeof(policy->facilitator_url),
+             "%s",
+             server_cfg->facilitator_url);
+    if(!server_cfg->settlement_mode_set) {
+      policy->settlement_mode = X402_SETTLEMENT_FACILITATOR;
+    }
+  }
+  if(server_cfg->facilitator_api_key[0] != '\0') {
+    snprintf(policy->facilitator_api_key,
+             sizeof(policy->facilitator_api_key),
+             "%s",
+             server_cfg->facilitator_api_key);
+  }
   if(server_cfg->stellar_config_dir[0] != '\0') {
     snprintf(policy->stellar_config_dir,
              sizeof(policy->stellar_config_dir),
@@ -3890,22 +3959,22 @@ static const command_rec x402_cmds[] = {
     AP_INIT_TAKE1("X402SettlementMode",
                   x402_cmd_settlement_mode,
                   NULL,
-                  OR_AUTHCFG,
+                  OR_AUTHCFG | RSRC_CONF | ACCESS_CONF,
                   "settlement mode"),
     AP_INIT_TAKE1("X402FacilitatorURL",
                   x402_cmd_facilitator_url,
                   NULL,
-                  OR_AUTHCFG,
+                  OR_AUTHCFG | RSRC_CONF | ACCESS_CONF,
                   "facilitator URL"),
     AP_INIT_TAKE1("X402FacilitatorAPIKey",
                   x402_cmd_facilitator_api_key,
                   NULL,
-                  OR_AUTHCFG,
+                  OR_AUTHCFG | RSRC_CONF | ACCESS_CONF,
                   "facilitator bearer API key"),
     AP_INIT_TAKE1("X402FacilitatorAPIKeyFile",
                   x402_cmd_facilitator_api_key_file,
                   NULL,
-                  OR_AUTHCFG,
+                  OR_AUTHCFG | RSRC_CONF | ACCESS_CONF,
                   "path to facilitator bearer API key file"),
     AP_INIT_TAKE1("X402StellarConfigDir",
                   x402_cmd_stellar_config_dir,

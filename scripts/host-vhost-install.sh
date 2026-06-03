@@ -81,6 +81,9 @@ emit_dynamic_intent_config() {
     X402ChallengeEndpoint $CHALLENGE_ENDPOINT
     X402DynamicCheckoutEndpoint $DYNAMIC_CHECKOUT_ENDPOINT
     X402IntentSecretFile $INTENT_SECRET_PATH
+    X402SettlementMode $DYNAMIC_SETTLEMENT_MODE
+    X402FacilitatorURL $FACILITATOR_URL
+    X402FacilitatorAPIKeyFile $FACILITATOR_KEY_PATH
 EOF
     if [[ "$ENABLE_SPLIT" == "1" ]]; then
       cat >> "$target" <<EOF
