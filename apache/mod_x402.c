@@ -115,6 +115,16 @@ static void x402_strip_trusted_request_headers(request_rec *r)
   apr_table_unset(r->headers_in, X402_TRUSTED_SETTLEMENT_MODE_HEADER);
 }
 
+static int x402_sanitize_client_request(request_rec *r)
+{
+  if(r == NULL || r->main != NULL) {
+    return DECLINED;
+  }
+
+  x402_strip_trusted_request_headers(r);
+  return DECLINED;
+}
+
 static void x402_set_trusted_payment_headers(request_rec *r,
                                              const char *payer,
                                              const char *transaction,
@@ -4095,6 +4105,7 @@ static void x402_register_hooks(apr_pool_t *pool)
   (void)pool;
   ap_hook_post_config(x402_post_config, NULL, NULL, APR_HOOK_MIDDLE);
   ap_hook_child_init(x402_child_init, NULL, NULL, APR_HOOK_MIDDLE);
+  ap_hook_post_read_request(x402_sanitize_client_request, NULL, NULL, APR_HOOK_FIRST);
   ap_hook_handler(x402_handle_challenge, NULL, proxy_successors, APR_HOOK_FIRST);
   ap_hook_access_checker(x402_handle_dynamic_checkout, NULL, NULL, APR_HOOK_FIRST);
   ap_hook_access_checker(x402_check_access, NULL, NULL, APR_HOOK_MIDDLE);
