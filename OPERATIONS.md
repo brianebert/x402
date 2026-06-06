@@ -139,6 +139,37 @@ Snippet files are inserted inside the generated `<VirtualHost>` block after
 Use them for per-vhost logging, `RedirectMatch`, temporary `LogLevel`, and
 similar Apache directives. Do not include `<VirtualHost>` wrappers in snippets.
 
+### Paid store-vhost publish endpoint
+
+`scripts/vhost-publish-service.py` runs a private local HTTP endpoint for
+installing generated store vhost env files. Install it on the x402 host with:
+
+```bash
+sudo /srv/x402/scripts/install-vhost-publish-service.sh
+```
+
+The service listens on `127.0.0.1:8017` by default and accepts:
+
+```text
+POST /internal/vhosts/publish
+```
+
+It requires `X-X402-Paid: true` unless
+`X402_VHOST_PUBLISH_ALLOW_UNPAID=1` is set for local testing. The service
+validates that:
+
+- `server_name` is a single `*.cryptify.shop` hostname
+- `store_id` contains only letters, digits, `_`, and `-`
+- `X402_PROXY_TARGET` is exactly
+  `http://10.120.0.4:8007/stores/<store_id>/`
+- TLS cert paths use the shared `cryptify.shop` certificate
+- dynamic checkout remains rooted at `/api/store/checkout`
+
+Expose it through an x402-protected admin vhost route by including the
+directives in `docs/admin-publish-vhost.inc`. That route charges `1000000`
+atomic units, currently intended as 0.10 USDC on the configured Stellar asset,
+then proxies paid requests to the private service.
+
 If you need a hard module refresh after changing C/C++ code, prefer a full Apache restart:
 
 ```sh
